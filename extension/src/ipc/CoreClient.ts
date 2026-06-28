@@ -1,0 +1,262 @@
+import * as net from "net";
+import * as os from "os";
+import * as path from "path";
+import {
+  PROTOCOL_VERSION,
+  RequestEnvelope,
+  ResponseEnvelope,
+  NotificationEnvelope,
+  HelloResponsePayload,
+  IpcError,
+  errorCodeFromPayload,
+} from "./protocol";
+import { PropertySchemaDto, TelemetrySample } from "./types";
+
+function toPipePath(name: string): string {
+  return process.platform === "win32"
+    ? `\\\\.\\pipe\\${name}`
+    : path.join(os.tmpdir(), `${name}.sock`);
+}
+
+type NotificationHandler = (n: NotificationEnvelope) => void;
+
+interface PendingRequest {
+  resolve: (payload: unknown) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Único ponto da Extension que sabe que existe um processo LasecSimul Core nativo.
+ * Toda a UI fala com CoreClient; nenhum outro módulo abre socket/pipe diretamente.
+ */
+export class CoreClient {
+  private socket: net.Socket | undefined;
+  private readonly pending = new Map<string, PendingRequest>();
+  private readonly notificationHandlers: NotificationHandler[] = [];
+  private requestCounter = 0;
+  private lineBuffer = "";
+  private readonly requestTimeoutMs: number;
+
+  constructor(private readonly pipeName: string, opts: { requestTimeoutMs?: number } = {}) {
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? 5_000;
+  }
+
+  /** Estabelece conexão com o Core e realiza o handshake de protocolo. */
+  async start(): Promise<void> {
+    await this._connect();
+    await this._handshake();
+  }
+
+  /** Envia shutdown ao Core e encerra o socket. Rejeita todas as requisições pendentes. */
+  async stop(): Promise<void> {
+    try {
+      await this.request("shutdown", {});
+    } catch {
+      // best-effort: Core pode já ter encerrado
+    }
+    this._destroy(new Error("CoreClient encerrado"));
+  }
+
+  /** Envia uma requisição ao Core e aguarda a resposta. */
+  async request(type: string, payload: unknown): Promise<unknown> {
+    if (!this.socket) {
+      throw new Error("CoreClient não está conectado");
+    }
+    const id = String(++this.requestCounter);
+    const envelope: RequestEnvelope = { id, type, payload, protocolVersion: PROTOCOL_VERSION };
+    return new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Requisição "${type}" (id=${id}) expirou após ${this.requestTimeoutMs}ms`));
+      }, this.requestTimeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      this.socket!.write(JSON.stringify(envelope) + "\n");
+    });
+  }
+
+  /** Registra um handler para notificações assíncronas enviadas pelo Core. */
+  onNotification(handler: NotificationHandler): void {
+    this.notificationHandlers.push(handler);
+  }
+
+  // ── controle de simulação ──────────────────────────────────────────────────
+
+  async run(): Promise<void> { await this.request("start", {}); }
+  async pause(): Promise<void> { await this.request("pause", {}); }
+  async step(): Promise<void> { await this.request("step", {}); }
+  /** Para a simulação sem encerrar a conexão IPC. */
+  async stopSimulation(): Promise<void> { await this.request("stop", {}); }
+
+  // ── controle do esquemático ────────────────────────────────────────────────
+
+  /** `pins`: built-ins ignoram o id (cada factory já tem o seu hardcoded, ex: "p1"/"p2") e só leem
+   * x/y; plugins (NativeDeviceProxy) usam estes ids DIRETAMENTE como os pinos da instância — sem
+   * isso, connectWire nunca acertaria o pino certo de um componente vindo de um plugin (ver
+   * .spec/lasecsimul.spec sobre instrumentos como plugin ABI). */
+  async addComponent(
+    typeId: string,
+    properties: Record<string, unknown>,
+    pins: Array<{ id: string; x: number; y: number }> = []
+  ): Promise<string> {
+    const resp = await this.request("addComponent", { typeId, properties, pins });
+    return (resp as { instanceId: string }).instanceId;
+  }
+
+  /** `requiresRestart: true` quando a propriedade alterada tem essa flag no schema (`Core` já
+   * aplicou a mudança normalmente; reinício automático não é feito aqui — ver Épico A do roadmap de
+   * pendências, decisão A3). Quem chama decide como avisar o usuário. */
+  async setProperty(instanceId: string, name: string, value: unknown): Promise<{ requiresRestart: boolean }> {
+    const resp = (await this.request("setProperty", { instanceId, name, value })) as
+      | { requiresRestart?: boolean }
+      | undefined;
+    return { requiresRestart: Boolean(resp?.requiresRestart) };
+  }
+
+  async connectWire(componentA: string, pinIdA: string, componentB: string, pinIdB: string): Promise<void> {
+    await this.request("connectWire", { componentA, pinIdA, componentB, pinIdB });
+  }
+
+  async removeComponent(instanceId: string): Promise<void> {
+    await this.request("removeComponent", { instanceId });
+  }
+
+  async loadDeviceLibrary(libraryJsonPath: string): Promise<void> {
+    // só deve ser chamado depois do fluxo de confiança/consentimento
+    await this.request("loadDeviceLibrary", { path: libraryJsonPath });
+  }
+
+  /** Bytes opacos de `IComponentModel::getState()` de uma instância (built-in ou plugin),
+   * devolvidos como hex — quem chama decide o que os bytes significam (ex: "instruments.voltmeter"
+   * é sempre 1 double little-endian = a última tensão medida). */
+  async getComponentState(instanceId: string): Promise<Buffer> {
+    const resp = await this.request("getComponentState", { instanceId });
+    const stateHex = (resp as { stateHex: string }).stateHex;
+    return Buffer.from(stateHex, "hex");
+  }
+
+  /** Saúde operacional da instância (`"ok" | "lagging" | "faulted"`) -- watchdog/CrashGuard do
+   * lado do plugin nativo, ver `.spec/lasecsimul-native-devices.spec` seção 13. Built-ins sempre
+   * respondem `"ok"`. */
+  async getComponentHealth(instanceId: string): Promise<"ok" | "lagging" | "faulted"> {
+    const resp = await this.request("getComponentHealth", { instanceId });
+    return (resp as { status: "ok" | "lagging" | "faulted" }).status;
+  }
+
+  /** Corrente elétrica no "ramo principal" da instância na última solve() -- convenção PASSIVA
+   * (positiva entrando no primeiro pino/saindo no segundo; fonte fornecendo energia aparece
+   * negativa). `undefined` quando o componente não implementa isso (Ground, Tunnel, etc.) --
+   * nunca lança por esse motivo. Opção de baixo custo do plano de leitura de corrente: sem
+   * incógnita nova no Core, lida sob demanda do estado já cacheado. */
+  async getComponentCurrent(instanceId: string): Promise<number | undefined> {
+    const resp = await this.request("getComponentCurrent", { instanceId });
+    const payload = resp as { hasCurrent: boolean; current?: number };
+    return payload.hasCurrent ? payload.current : undefined;
+  }
+
+  /** Tensão atual do nó ao qual `pinId` da instância `instanceId` está resolvido -- usado pra
+   * colorir/animar fios na Webview (vermelho/azul conforme tensão, ver ConnectorLine do SimulIDE),
+   * sem precisar de um instrumento. Lê o mesmo valor que `IComponentModel`/instrumentos já leem
+   * internamente via `getNodeVoltage()` do solver. */
+  async getNodeVoltage(instanceId: string, pinId: string): Promise<number> {
+    const resp = await this.request("getNodeVoltage", { instanceId, pinId });
+    return (resp as { voltage: number }).voltage;
+  }
+
+  /** Schema rico de propriedades (grupo/editor/min/max/opções/flags) de TODO typeId já registrado
+   * no Core neste momento — built-in (sempre presente) e plugin (só depois de `loadDeviceLibrary`
+   * bem-sucedido). Por `typeId`, nunca por instância — chamar de novo depois de carregar uma
+   * library nova pega os typeIds que acabaram de ficar disponíveis. `language` (BCP-47, opcional):
+   * pede `label`/`group`/opções traduzidos quando o `device.json`/built-in tiver essa tradução
+   * declarada (`translations`); sem isso (ou sem tradução pra essa língua), devolve na língua-base
+   * do componente -- nunca falha, ver `lasecsimul.spec` seção 6.3.3. */
+  async getPropertySchemas(language?: string): Promise<Record<string, PropertySchemaDto[]>> {
+    const resp = await this.request("getPropertySchemas", { language });
+    return (resp as { schemasByTypeId: Record<string, PropertySchemaDto[]> }).schemasByTypeId;
+  }
+
+  onTelemetry(callback: (sample: TelemetrySample) => void): void {
+    // assina notificações de telemetria pelo canal de controle (alta frequência usa shm)
+    this.onNotification((n) => {
+      if (n.type === "telemetry") callback(n.payload as TelemetrySample);
+    });
+  }
+
+  // ── privado ────────────────────────────────────────────────────────────────
+
+  private _connect(): Promise<void> {
+    const maxAttempts = 20;
+    const retryDelayMs = 150;
+    let attempt = 0;
+    const tryOnce = (): Promise<void> =>
+      new Promise((resolve, reject) => {
+        const socket = net.createConnection(toPipePath(this.pipeName));
+        socket.once("connect", () => {
+          this.socket = socket;
+          socket.on("data", (d: Buffer) => this._onData(d));
+          socket.once("close", () =>
+            this._destroy(new Error("Conexão com Core encerrada inesperadamente"))
+          );
+          resolve();
+        });
+        socket.once("error", reject);
+      });
+
+    const retry = (): Promise<void> =>
+      tryOnce().catch((err) => {
+        attempt++;
+        if (attempt >= maxAttempts) {
+          throw new Error(`Não foi possível conectar ao Core após ${maxAttempts} tentativas: ${err}`);
+        }
+        return new Promise((r) => setTimeout(r, retryDelayMs)).then(retry);
+      });
+
+    return retry();
+  }
+
+  private async _handshake(): Promise<void> {
+    const resp = (await this.request("hello", { clientVersion: "0.1.0" })) as HelloResponsePayload;
+    if (resp.protocolVersion !== PROTOCOL_VERSION) {
+      throw new Error(
+        `Versão de protocolo incompatível: cliente=${PROTOCOL_VERSION}, servidor=${resp.protocolVersion}`
+      );
+    }
+  }
+
+  private _onData(data: Buffer): void {
+    this.lineBuffer += data.toString("utf8");
+    const lines = this.lineBuffer.split("\n");
+    this.lineBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const t = line.trim();
+      if (t) this._dispatch(t);
+    }
+  }
+
+  private _dispatch(raw: string): void {
+    let msg: unknown;
+    try { msg = JSON.parse(raw); } catch { return; }
+    if (typeof msg !== "object" || msg === null) return;
+    if ("id" in msg) {
+      const r = msg as ResponseEnvelope;
+      const p = this.pending.get(r.id);
+      if (!p) return;
+      clearTimeout(p.timer);
+      this.pending.delete(r.id);
+      r.ok ? p.resolve(r.payload) : p.reject(new IpcError(r.error ?? "Erro no Core", errorCodeFromPayload(r.payload)));
+    } else {
+      const n = msg as NotificationEnvelope;
+      this.notificationHandlers.forEach((h) => h(n));
+    }
+  }
+
+  private _destroy(err: Error): void {
+    this.socket?.destroy();
+    this.socket = undefined;
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this.pending.clear();
+  }
+}

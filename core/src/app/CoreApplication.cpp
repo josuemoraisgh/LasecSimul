@@ -1,0 +1,1190 @@
+#include "CoreApplication.hpp"
+#include "../ipc/IpcServer.hpp"
+#include "../ipc/Protocol.hpp"
+#include "../plugins/GlobalPluginCache.hpp"
+#include "../registry/SubcircuitRegistry.hpp"
+#include "../session/SimulationSession.hpp"
+#include "../components/SimulideBuiltins.hpp"
+#include "../components/active/Diode.hpp"
+#include "../components/meters/Ampmeter.hpp"
+#include "../components/meters/FreqMeter.hpp"
+#include "../components/meters/LogicAnalyzer.hpp"
+#include "../components/meters/Oscope.hpp"
+#include "../components/meters/Probe.hpp"
+#include "../components/sources/Battery.hpp"
+#include "../components/sources/Clock.hpp"
+#include "../components/sources/Csource.hpp"
+#include "../components/sources/CurrSource.hpp"
+#include "../components/sources/FixedVolt.hpp"
+#include "../components/sources/Rail.hpp"
+#include "../components/sources/VoltSource.hpp"
+#include "../components/sources/WaveGen.hpp"
+#include "../components/connectors/Tunnel.hpp"
+#include "../components/connectors/Junction.hpp"
+#include "../components/logic/Button.hpp"
+#include "../components/other/Ground.hpp"
+#include "../components/passive/Capacitor.hpp"
+#include "../components/passive/Inductor.hpp"
+#include "../components/passive/Resistor.hpp"
+#include "../components/sources/DcVoltageSource.hpp"
+#include "../mcu/esp32/Esp32Adapter.hpp"
+#include <nlohmann/json.hpp>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <string>
+
+namespace lasecsimul::app {
+
+using namespace lasecsimul;
+using namespace lasecsimul::registry;
+using namespace lasecsimul::plugins;
+using namespace lasecsimul::session;
+using namespace lasecsimul::ipc;
+
+// ── impl ───────────────────────────────────────────────────────────────────────
+
+struct CoreApplication::Impl {
+    CoreConfig config;
+    GlobalPluginCache pluginCache;
+    SimulationSession session;
+    IpcServer ipcServer;
+
+    explicit Impl(CoreConfig cfg)
+        : config(std::move(cfg))
+        , session(pluginCache)
+        , ipcServer(config.pipeName) {}
+};
+
+// ── componentes built-in ───────────────────────────────────────────────────────
+
+namespace {
+
+/** Registra a factory (`reg`) E a metadata estática (`metadata` — `ComponentMetadataRegistry`, a
+ * mesma usada por plugins via `loadDeviceLibraryFile`) de um typeId num só lugar, pra nunca ficar
+ * uma sem a outra. `pins` vazio é seguro pra built-in: nenhum handler IPC lê `ComponentMetadata::pins`
+ * hoje, só a Webview decide layout de pino (`componentSymbols.ts`). */
+Pin makePinOr(const Pin& source, const char* fallbackId) {
+    Pin pin = source;
+    if (pin.id.empty()) pin.id = fallbackId;
+    return pin;
+}
+
+std::array<Pin, 2> makePins2(const ComponentParams& p, const char* a = "pin-1", const char* b = "pin-2") {
+    const auto pos = p.pins<2>();
+    return {makePinOr(pos[0], a), makePinOr(pos[1], b)};
+}
+
+std::array<Pin, 3> makePins3(const ComponentParams& p, const char* a = "pin-1", const char* b = "pin-2",
+                             const char* c = "pin-3") {
+    const auto pos = p.pins<3>();
+    return {makePinOr(pos[0], a), makePinOr(pos[1], b), makePinOr(pos[2], c)};
+}
+
+std::vector<Pin> makePinVector(const ComponentParams& p, size_t count) {
+    std::vector<Pin> pins;
+    pins.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        Pin pin = i < p.pinList.size() ? p.pinList[i] : Pin{};
+        if (pin.id.empty()) pin.id = "pin-" + std::to_string(i + 1);
+        pins.push_back(std::move(pin));
+    }
+    return pins;
+}
+
+void registerBuiltinComponents(ComponentRegistry& reg, registry::ComponentMetadataRegistry& metadata,
+                                simulation::Scheduler& scheduler) {
+    const auto registerBuiltinMetadata =
+        [&metadata](std::string typeId,
+                    std::string displayName,
+                    std::vector<PropertySchema> propertySchema,
+                    std::string translationsJson) {
+            metadata.registerMetadata({
+                std::move(typeId),
+                std::move(displayName),
+                {},
+                std::move(propertySchema),
+                "",
+                "pt-BR",
+                std::move(translationsJson),
+            });
+        };
+    reg.registerFactory("passive.resistor", [](const ComponentParams& p) {
+        const auto pos = p.pins<2>();
+        return std::make_unique<components::Resistor>(
+            std::array<Pin, 2>{Pin{pos[0].id.empty() ? "p1" : pos[0].id, pos[0].x, pos[0].y},
+                                Pin{pos[1].id.empty() ? "p2" : pos[1].id, pos[1].x, pos[1].y}},
+            p.property("resistance", 1000.0));
+    });
+    registerBuiltinMetadata(
+        "passive.resistor",
+        "Resistor",
+        components::Resistor::propertySchema(),
+        R"json({"en":{"name":"Resistor","properties":{"resistance":{"label":"Resistance","group":"Electrical"}}}})json");
+
+    reg.registerFactory("passive.capacitor", [](const ComponentParams& p) {
+        const auto pos = p.pins<2>();
+        return std::make_unique<components::Capacitor>(
+            std::array<Pin, 2>{Pin{pos[0].id.empty() ? "p1" : pos[0].id, pos[0].x, pos[0].y},
+                                Pin{pos[1].id.empty() ? "p2" : pos[1].id, pos[1].x, pos[1].y}},
+            p.property("capacitance", 1e-6));
+    });
+    registerBuiltinMetadata(
+        "passive.capacitor",
+        "Capacitor",
+        components::Capacitor::propertySchema(),
+        R"json({"en":{"name":"Capacitor","properties":{"capacitance":{"label":"Capacitance","group":"Electrical"}}}})json");
+
+    reg.registerFactory("passive.inductor", [](const ComponentParams& p) {
+        const auto pos = p.pins<2>();
+        return std::make_unique<components::Inductor>(
+            std::array<Pin, 2>{Pin{pos[0].id.empty() ? "p1" : pos[0].id, pos[0].x, pos[0].y},
+                                Pin{pos[1].id.empty() ? "p2" : pos[1].id, pos[1].x, pos[1].y}},
+            p.property("inductance", 1e-3));
+    });
+    registerBuiltinMetadata(
+        "passive.inductor",
+        "Indutor",
+        components::Inductor::propertySchema(),
+        R"json({"en":{"name":"Inductor","properties":{"inductance":{"label":"Inductance","group":"Electrical"}}}})json");
+
+    reg.registerFactory("connectors.tunnel", [](const ComponentParams& p) {
+        const auto pos = p.pins<1>();
+        return std::make_unique<components::Tunnel>(Pin{pos[0].id.empty() ? "pin" : pos[0].id, pos[0].x, pos[0].y});
+    });
+    registerBuiltinMetadata(
+        "connectors.tunnel",
+        "Túnel",
+        std::vector<PropertySchema>{},
+        R"json({"en":{"name":"Tunnel"}})json");
+
+    reg.registerFactory("connectors.junction", [](const ComponentParams& p) {
+        const auto pos = p.pins<1>();
+        return std::make_unique<components::Junction>(Pin{pos[0].id.empty() ? "pin" : pos[0].id, pos[0].x, pos[0].y});
+    });
+    registerBuiltinMetadata(
+        "connectors.junction",
+        "Junção",
+        std::vector<PropertySchema>{},
+        R"json({"en":{"name":"Junction"}})json");
+
+    reg.registerFactory("other.ground", [](const ComponentParams& p) {
+        const auto pos = p.pins<1>();
+        return std::make_unique<components::Ground>(Pin{pos[0].id.empty() ? "pin" : pos[0].id, pos[0].x, pos[0].y});
+    });
+    registerBuiltinMetadata(
+        "other.ground",
+        "Terra (0 V)",
+        std::vector<PropertySchema>{},
+        R"json({"en":{"name":"Ground (0 V)"}})json");
+
+    reg.registerFactory("sources.dc_voltage", [](const ComponentParams& p) {
+        const auto pos = p.pins<2>();
+        return std::make_unique<components::DcVoltageSource>(
+            std::array<Pin, 2>{Pin{pos[0].id.empty() ? "p1" : pos[0].id, pos[0].x, pos[0].y},
+                                Pin{pos[1].id.empty() ? "p2" : pos[1].id, pos[1].x, pos[1].y}},
+            p.property("voltage", 5.0));
+    });
+    registerBuiltinMetadata(
+        "sources.dc_voltage",
+        "Fonte de Tensão",
+        components::DcVoltageSource::propertySchema(),
+        R"json({"en":{"name":"DC Voltage Source","properties":{"voltage":{"label":"Voltage","group":"Electrical"}}}})json");
+
+    reg.registerFactory("active.diode", [](const ComponentParams& p) {
+        const auto pos = p.pins<2>();
+        return std::make_unique<components::Diode>(
+            std::array<Pin, 2>{Pin{pos[0].id.empty() ? "anode" : pos[0].id, pos[0].x, pos[0].y},
+                                Pin{pos[1].id.empty() ? "cathode" : pos[1].id, pos[1].x, pos[1].y}},
+            p.property("saturationCurrent", 1e-12));
+    });
+    registerBuiltinMetadata(
+        "active.diode",
+        "Diodo",
+        components::Diode::propertySchema(),
+        R"json({"en":{"name":"Diode","properties":{"saturationCurrent":{"label":"Saturation Current","group":"Electrical"}}}})json");
+
+    reg.registerFactory("logic.button", [](const ComponentParams& p) {
+        const auto pos = p.pins<2>();
+        return std::make_unique<components::Button>(
+            std::array<Pin, 2>{Pin{pos[0].id.empty() ? "p1" : pos[0].id, pos[0].x, pos[0].y},
+                                Pin{pos[1].id.empty() ? "p2" : pos[1].id, pos[1].x, pos[1].y}},
+            p.property("pressed", false));
+    });
+    registerBuiltinMetadata(
+        "logic.button",
+        "Botão",
+        components::Button::propertySchema(),
+        R"json({"en":{"name":"Push Button","properties":{"pressed":{"label":"Pressed","group":"Electrical"}}}})json");
+
+    const auto englishName = [](const std::string& label) { return R"json({"en":{"name":")json" + label + R"json("}})json"; };
+
+    const auto registerResistorLike = [&](const std::string& typeId, const std::string& label, double defaultOhm) {
+        std::vector<PropertySchema> schema{
+            components::detail::numberSchema("resistance", "Resistencia", "ohm", defaultOhm, 1e-9, 1.0,
+                                             PropertySchemaShowOnSymbol)};
+        reg.registerFactory(typeId, [&, typeId, schema, defaultOhm](const ComponentParams& p) {
+            return std::make_unique<components::SimulideTwoPinResistor>(typeId, makePins2(p),
+                                                                        p.property("resistance", defaultOhm), schema);
+        });
+        registerBuiltinMetadata(typeId, label, schema, englishName(label));
+    };
+    registerResistorLike("passive.variable_resistor", "Variable Resistor", 10000.0);
+    registerResistorLike("passive.resistor_dip", "ResistorDip", 1000.0);
+    registerResistorLike("passive.ldr", "LDR", 1000.0);
+    registerResistorLike("passive.thermistor", "Thermistor", 10000.0);
+    registerResistorLike("passive.rtd", "RTD", 100.0);
+    registerResistorLike("passive.force_strain_gauge", "Force Strain Gauge", 350.0);
+
+    reg.registerFactory("passive.potentiometer", [&](const ComponentParams& p) {
+        return std::make_unique<components::SimulidePotentiometer>(
+            "passive.potentiometer", makePins3(p), p.property("resistance", 10000.0), p.property("position", 0.5));
+    });
+    registerBuiltinMetadata("passive.potentiometer", "Potentiometer", components::SimulidePotentiometer::propertySchema(),
+                            englishName("Potentiometer"));
+
+    reg.registerFactory("passive.electrolytic_capacitor", [&](const ComponentParams& p) {
+        return std::make_unique<components::Capacitor>(makePins2(p), p.property("capacitance", 1e-6));
+    });
+    registerBuiltinMetadata("passive.electrolytic_capacitor", "Electrolytic Capacitor",
+                            components::Capacitor::propertySchema(), englishName("Electrolytic Capacitor"));
+    reg.registerFactory("passive.variable_capacitor", [&](const ComponentParams& p) {
+        return std::make_unique<components::Capacitor>(makePins2(p), p.property("capacitance", 1e-6));
+    });
+    registerBuiltinMetadata("passive.variable_capacitor", "Variable Capacitor", components::Capacitor::propertySchema(),
+                            englishName("Variable Capacitor"));
+    reg.registerFactory("passive.variable_inductor", [&](const ComponentParams& p) {
+        return std::make_unique<components::Inductor>(makePins2(p), p.property("inductance", 1e-3));
+    });
+    registerBuiltinMetadata("passive.variable_inductor", "Variable Inductor", components::Inductor::propertySchema(),
+                            englishName("Variable Inductor"));
+
+    std::vector<PropertySchema> transformerSchema{
+        components::detail::numberSchema("coupling", "Coeficiente de Acoplamento", "", 0.99, 0.0, 0.01),
+        components::detail::numberSchema("baseInductance", "Indutancia Base", "H", 1.0, 1e-9, 0.1)};
+    transformerSchema[0].maxValue = 1.0;
+    reg.registerFactory("passive.transformer", [&, transformerSchema](const ComponentParams& p) {
+        return std::make_unique<components::SimulidePassiveState>("passive.transformer", makePinVector(p, 4), transformerSchema);
+    });
+    registerBuiltinMetadata("passive.transformer", "Transformer", transformerSchema, englishName("Transformer"));
+
+    const auto registerSwitchLike = [&](const std::string& typeId, const std::string& label, size_t pinCount) {
+        reg.registerFactory(typeId, [&, typeId, pinCount](const ComponentParams& p) {
+            return std::make_unique<components::SimulideSwitch>(
+                typeId, makePinVector(p, pinCount), p.property("closed", false), p.property("normallyClosed", false));
+        });
+        registerBuiltinMetadata(typeId, label, components::SimulideSwitch::propertySchema(), englishName(label));
+    };
+    registerSwitchLike("switches.push", "Push", 2);
+    registerSwitchLike("switches.switch", "Switch (all)", 2);
+    registerSwitchLike("switches.switch_dip", "Switch Dip", 16);
+
+    reg.registerFactory("switches.relay", [&](const ComponentParams& p) {
+        return std::make_unique<components::SimulideRelay>(makePinVector(p, 4), p.property("iOn", 15.0),
+                                                           p.property("iOff", 5.0),
+                                                           p.property("normallyClosed", false));
+    });
+    registerBuiltinMetadata("switches.relay", "Relay (all)", components::SimulideRelay::propertySchema(),
+                            englishName("Relay (all)"));
+
+    std::vector<PropertySchema> keypadSchema{
+        components::detail::boolSchema("diodes", "Diodos", false),
+        components::detail::boolSchema("diodesDirection", "Direcao dos Diodos", false),
+        components::detail::numberSchema("rows", "Linhas", "", 4.0, 1.0, 1.0, PropertySchemaAffectsTopology),
+        components::detail::numberSchema("columns", "Colunas", "", 4.0, 1.0, 1.0, PropertySchemaAffectsTopology),
+        components::detail::textSchema("keyLabels", "Rotulos", "123A456B789C*0#D")};
+    reg.registerFactory("switches.keypad", [&, keypadSchema](const ComponentParams& p) {
+        return std::make_unique<components::SimulidePassiveState>("switches.keypad", makePinVector(p, 8), keypadSchema);
+    });
+    registerBuiltinMetadata("switches.keypad", "KeyPad", keypadSchema, englishName("KeyPad"));
+
+    const auto registerDiodeLike = [&](const std::string& typeId, const std::string& label, double threshold) {
+        reg.registerFactory(typeId, [&, typeId, threshold](const ComponentParams& p) {
+            return std::make_unique<components::SimulideDiodeLike>(
+                typeId, makePins2(p), p.property("threshold", threshold), p.property("resistance", 1.0));
+        });
+        registerBuiltinMetadata(typeId, label, components::SimulideDiodeLike::propertySchema(threshold, 1.0),
+                                englishName(label));
+    };
+    registerDiodeLike("active.zener", "Zener Diode", 5.1);
+    registerDiodeLike("active.diac", "Diac", 30.0);
+    registerDiodeLike("active.scr", "SCR", 0.8);
+    registerDiodeLike("active.triac", "Triac", 0.8);
+
+    const auto registerTransistorLike = [&](const std::string& typeId, const std::string& label, bool pnp) {
+        reg.registerFactory(typeId, [&, typeId, pnp](const ComponentParams& p) {
+            return std::make_unique<components::SimulideTransistorLike>(typeId, makePins3(p), p.property("beta", 100.0), pnp);
+        });
+        registerBuiltinMetadata(typeId, label, components::SimulideTransistorLike::propertySchema(), englishName(label));
+    };
+    registerTransistorLike("active.bjt", "BJT", false);
+    registerTransistorLike("active.mosfet", "Mosfet", false);
+    registerTransistorLike("active.jfet", "Jfet", false);
+
+    std::vector<PropertySchema> opAmpSchema{components::detail::numberSchema("gain", "Ganho", "", 100000.0, 1.0, 1000.0)};
+    reg.registerFactory("active.opamp", [&, opAmpSchema](const ComponentParams& p) {
+        return std::make_unique<components::SimulidePassiveState>("active.opamp", makePinVector(p, 5), opAmpSchema);
+    });
+    registerBuiltinMetadata("active.opamp", "OpAmp", opAmpSchema, englishName("OpAmp"));
+    reg.registerFactory("active.comparator", [&, opAmpSchema](const ComponentParams& p) {
+        return std::make_unique<components::SimulidePassiveState>("active.comparator", makePinVector(p, 5), opAmpSchema);
+    });
+    registerBuiltinMetadata("active.comparator", "Comparator", opAmpSchema, englishName("Comparator"));
+
+    std::vector<PropertySchema> muxAnalogSchema{
+        components::detail::numberSchema("channels", "Canais", "", 3.0, 1.0, 1.0, PropertySchemaAffectsTopology)};
+    reg.registerFactory("active.analog_mux", [&, muxAnalogSchema](const ComponentParams& p) {
+        return std::make_unique<components::SimulidePassiveState>("active.analog_mux", makePinVector(p, 5), muxAnalogSchema);
+    });
+    registerBuiltinMetadata("active.analog_mux", "Analog Mux", muxAnalogSchema, englishName("Analog Mux"));
+
+    reg.registerFactory("active.volt_regulator", [&](const ComponentParams& p) {
+        return std::make_unique<components::SimulideVoltageRegulator>(makePins3(p), p.property("voltage", 5.0));
+    });
+    registerBuiltinMetadata("active.volt_regulator", "Volt. Regulator",
+                            components::SimulideVoltageRegulator::propertySchema(), englishName("Volt. Regulator"));
+
+    const auto registerOutputState = [&](const std::string& typeId, const std::string& label, size_t pinCount,
+                                         std::vector<PropertySchema> schema) {
+        reg.registerFactory(typeId, [&, typeId, pinCount, schema](const ComponentParams& p) {
+            return std::make_unique<components::SimulidePassiveState>(typeId, makePinVector(p, pinCount), schema);
+        });
+        registerBuiltinMetadata(typeId, label, schema, englishName(label));
+    };
+    registerDiodeLike("outputs.led", "Led", 2.0);
+    registerOutputState("outputs.led_rgb", "Led Rgb", 4,
+                        {components::detail::numberSchema("threshold", "Tensao Direta", "V", 2.0, 0.0, 0.01)});
+    registerOutputState("outputs.led_bar", "Led Bar", 16,
+                        {components::detail::numberSchema("size", "Tamanho", "Leds", 8.0, 1.0, 1.0, PropertySchemaAffectsTopology)});
+    registerOutputState("outputs.led_matrix", "LedMatrix", 16,
+                        {components::detail::numberSchema("rows", "Linhas", "Leds", 8.0, 1.0, 1.0, PropertySchemaAffectsTopology),
+                         components::detail::numberSchema("columns", "Colunas", "Leds", 8.0, 1.0, 1.0, PropertySchemaAffectsTopology)});
+    registerOutputState("outputs.max72xx_matrix", "Max72xx matrix", 5,
+                        {components::detail::numberSchema("rows", "Linhas", "Leds", 8.0, 1.0, 1.0),
+                         components::detail::numberSchema("columns", "Colunas", "Leds", 8.0, 1.0, 1.0)});
+    registerOutputState("outputs.ws2812", "WS2812 Led", 3,
+                        {components::detail::numberSchema("rows", "Linhas", "Leds", 1.0, 1.0, 1.0),
+                         components::detail::numberSchema("columns", "Colunas", "Leds", 1.0, 1.0, 1.0)});
+    registerOutputState("outputs.seven_segment", "7 Segment", 10,
+                        {components::detail::numberSchema("size", "Tamanho", "Leds", 8.0, 1.0, 1.0)});
+    registerOutputState("outputs.hd44780", "Hd44780", 16, {});
+    registerOutputState("outputs.aip31068_i2c", "Aip31068 I2C", 4, {});
+    registerOutputState("outputs.pcd8544", "Pcd8544", 8, {});
+    registerOutputState("outputs.ks0108", "KS0108", 20, {});
+    registerOutputState("outputs.ssd1306", "SSD1306", 4, {});
+    registerOutputState("outputs.sh1107", "Sh1107", 4, {});
+    registerOutputState("outputs.st7735", "St7735", 8, {});
+    registerOutputState("outputs.st7789", "St7789", 8, {});
+    registerOutputState("outputs.ili9341", "Ili9341", 8, {});
+    registerOutputState("outputs.gc9a01a", "GC9A01A", 8, {});
+    registerOutputState("outputs.pcf8833", "Pcf8833", 8, {});
+    registerOutputState("outputs.dc_motor", "Dc Motor", 2,
+                        {components::detail::numberSchema("resistance", "Resistencia", "ohm", 10.0, 1e-9, 1.0)});
+    registerOutputState("outputs.stepper", "Stepper", 4,
+                        {components::detail::numberSchema("resistance", "Resistencia", "ohm", 10.0, 1e-9, 1.0)});
+    registerOutputState("outputs.servo", "Servo Motor", 3,
+                        {components::detail::numberSchema("minPulse", "Pulso Minimo", "us", 1000.0, 1.0, 10.0),
+                         components::detail::numberSchema("maxPulse", "Pulso Maximo", "us", 2000.0, 1.0, 10.0)});
+    registerOutputState("outputs.audio_out", "Audio Out", 1, {});
+    registerOutputState("outputs.incandescent_lamp", "Incandescent lamp", 2,
+                        {components::detail::numberSchema("resistance", "Resistencia", "ohm", 100.0, 1e-9, 1.0)});
+
+    // ── Fontes (pasta "Sources" do SimulIDE) ────────────────────────────────────
+    reg.registerFactory("sources.battery", [](const ComponentParams& p) {
+        return std::make_unique<components::Battery>(makePins2(p, "p1", "p2"), p.property("voltage", 5.0),
+                                                      p.property("resistance", 1e-3));
+    });
+    registerBuiltinMetadata("sources.battery", "Bateria", components::Battery::propertySchema(), englishName("Battery"));
+
+    reg.registerFactory("sources.rail", [](const ComponentParams& p) {
+        const auto pos = p.pins<1>();
+        return std::make_unique<components::Rail>(Pin{pos[0].id.empty() ? "out" : pos[0].id, pos[0].x, pos[0].y},
+                                                   p.property("voltage", 5.0));
+    });
+    registerBuiltinMetadata("sources.rail", "Trilho (Rail)", components::Rail::propertySchema(), englishName("Rail"));
+
+    reg.registerFactory("sources.fixed_volt", [](const ComponentParams& p) {
+        const auto pos = p.pins<1>();
+        return std::make_unique<components::FixedVolt>(Pin{pos[0].id.empty() ? "out" : pos[0].id, pos[0].x, pos[0].y},
+                                                        p.property("voltage", 5.0), p.property("out", true));
+    });
+    registerBuiltinMetadata("sources.fixed_volt", "Tensão Fixa", components::FixedVolt::propertySchema(),
+                            englishName("Fixed Voltage"));
+
+    reg.registerFactory("sources.voltage_source", [](const ComponentParams& p) {
+        const auto pos = p.pins<1>();
+        return std::make_unique<components::VoltSource>(Pin{pos[0].id.empty() ? "out" : pos[0].id, pos[0].x, pos[0].y},
+                                                         p.property("value", 5.0), p.property("minValue", 0.0),
+                                                         p.property("maxValue", 5.0));
+    });
+    registerBuiltinMetadata("sources.voltage_source", "Fonte de Tensão Variável", components::VoltSource::propertySchema(),
+                            englishName("Voltage Source"));
+
+    reg.registerFactory("sources.current_source", [](const ComponentParams& p) {
+        const auto pos = p.pins<1>();
+        return std::make_unique<components::CurrSource>(Pin{pos[0].id.empty() ? "out" : pos[0].id, pos[0].x, pos[0].y},
+                                                         p.property("value", 1.0), p.property("minValue", 0.0),
+                                                         p.property("maxValue", 1.0));
+    });
+    registerBuiltinMetadata("sources.current_source", "Fonte de Corrente", components::CurrSource::propertySchema(),
+                            englishName("Current Source"));
+
+    reg.registerFactory("sources.controlled_source", [](const ComponentParams& p) {
+        const auto pos = makePinVector(p, 4);
+        return std::make_unique<components::Csource>(
+            std::array<Pin, 4>{pos[0], pos[1], pos[2], pos[3]}, p.property("controlPins", true),
+            p.property("currSource", true), p.property("currControl", false), p.property("gain", 1.0),
+            p.property("voltage", 5.0), p.property("current", 1.0));
+    });
+    registerBuiltinMetadata("sources.controlled_source", "Fonte Controlada", components::Csource::propertySchema(),
+                            englishName("Controlled Source"));
+
+    reg.registerFactory("sources.clock", [&scheduler](const ComponentParams& p) {
+        const auto pos = p.pins<1>();
+        return std::make_unique<components::Clock>(scheduler, Pin{pos[0].id.empty() ? "out" : pos[0].id, pos[0].x, pos[0].y},
+                                                    p.property("voltage", 5.0), p.property("freqHz", 1000.0),
+                                                    p.property("alwaysOn", false));
+    });
+    registerBuiltinMetadata("sources.clock", "Clock", components::Clock::propertySchema(), englishName("Clock"));
+
+    reg.registerFactory("sources.wave_gen", [&scheduler](const ComponentParams& p) {
+        return std::make_unique<components::WaveGen>(scheduler, makePins2(p, "out", "gnd"), p.property("freqHz", 1000.0));
+    });
+    registerBuiltinMetadata("sources.wave_gen", "Gerador de Onda", components::WaveGen::propertySchema(),
+                            englishName("Wave Generator"));
+
+    // ── Medidores (pasta "Meters" do SimulIDE) ──────────────────────────────────
+    reg.registerFactory("meters.probe", [](const ComponentParams& p) {
+        const auto pos = p.pins<1>();
+        return std::make_unique<components::Probe>(Pin{pos[0].id.empty() ? "in" : pos[0].id, pos[0].x, pos[0].y},
+                                                    p.property("threshold", 2.5));
+    });
+    registerBuiltinMetadata("meters.probe", "Sonda (Probe)", components::Probe::propertySchema(), englishName("Probe"));
+
+    reg.registerFactory("meters.ampmeter", [](const ComponentParams& p) {
+        const auto pos = makePinVector(p, 3);
+        return std::make_unique<components::Ampmeter>(std::array<Pin, 3>{pos[0], pos[1], pos[2]},
+                                                       p.property("resistance", 1e-6));
+    });
+    registerBuiltinMetadata("meters.ampmeter", "Amperímetro", components::Ampmeter::propertySchema(),
+                            englishName("Ampmeter"));
+
+    reg.registerFactory("meters.freqmeter", [&scheduler](const ComponentParams& p) {
+        const auto pos = p.pins<1>();
+        return std::make_unique<components::FreqMeter>(
+            scheduler, Pin{pos[0].id.empty() ? "in" : pos[0].id, pos[0].x, pos[0].y}, p.property("filter", 0.1));
+    });
+    registerBuiltinMetadata("meters.freqmeter", "Frequencímetro", components::FreqMeter::propertySchema(),
+                            englishName("Frequency Meter"));
+
+    reg.registerFactory("meters.oscope", [](const ComponentParams& p) {
+        const auto pos = makePinVector(p, components::Oscope::kChannelCount);
+        return std::make_unique<components::Oscope>(
+            std::array<Pin, components::Oscope::kChannelCount>{pos[0], pos[1], pos[2], pos[3]});
+    });
+    registerBuiltinMetadata("meters.oscope", "Osciloscópio", components::Oscope::propertySchema(),
+                            englishName("Oscilloscope"));
+
+    reg.registerFactory("meters.logic_analyzer", [](const ComponentParams& p) {
+        const auto pos = makePinVector(p, components::LogicAnalyzer::kChannelCount);
+        std::array<Pin, components::LogicAnalyzer::kChannelCount> pins{};
+        for (size_t i = 0; i < components::LogicAnalyzer::kChannelCount; ++i) pins[i] = pos[i];
+        return std::make_unique<components::LogicAnalyzer>(pins, p.property("threshold", 2.5));
+    });
+    registerBuiltinMetadata("meters.logic_analyzer", "Analisador Lógico", components::LogicAnalyzer::propertySchema(),
+                            englishName("Logic Analyzer"));
+}
+
+void registerBuiltinMcuAdapters(registry::McuRegistry& reg) {
+    if (reg.contains("espressif.esp32")) return;
+    reg.registerFactory("espressif.esp32", [] {
+        return std::make_unique<mcu::esp32::Esp32Adapter>();
+    });
+}
+
+} // namespace
+
+// ── dispatch de mensagens IPC ──────────────────────────────────────────────────
+
+namespace {
+
+PropertyValue jsonToPropertyValue(const nlohmann::json& value) {
+    if (value.is_boolean()) return value.get<bool>();
+    if (value.is_string()) return value.get<std::string>();
+    if (value.is_object() && value.contains("x") && value.contains("y")) {
+        return PropertyPoint{value.value("x", 0.0), value.value("y", 0.0)};
+    }
+    return value.get<double>();
+}
+
+PropertyValueKind parsePropertyValueKind(const std::string& valueKind, const std::string& editor) {
+    if (valueKind == "number" || valueKind == "double" || valueKind == "int" || valueKind == "uint") {
+        return PropertyValueKind::Number;
+    }
+    if (valueKind == "bool" || valueKind == "boolean") return PropertyValueKind::Bool;
+    if (valueKind == "point") return PropertyValueKind::Point;
+    if (valueKind == "string" || valueKind == "text" || valueKind == "enum" || valueKind == "color"
+        || valueKind == "path" || valueKind == "file") {
+        return PropertyValueKind::String;
+    }
+    if (editor == "checkbox" || editor == "switch") return PropertyValueKind::Bool;
+    return PropertyValueKind::String;
+}
+
+uint32_t parsePropertyFlags(const nlohmann::json& propertyJson) {
+    uint32_t flags = PropertySchemaNone;
+    if (propertyJson.value("hidden", false)) flags |= PropertySchemaHidden;
+    if (propertyJson.value("readOnly", false)) flags |= PropertySchemaReadOnly;
+    if (propertyJson.value("noCopy", false)) flags |= PropertySchemaNoCopy;
+    if (propertyJson.value("affectsTopology", false)) flags |= PropertySchemaAffectsTopology;
+    if (propertyJson.value("requiresRestart", false)) flags |= PropertySchemaRequiresRestart;
+    if (propertyJson.value("showOnSymbol", false)) flags |= PropertySchemaShowOnSymbol;
+    return flags;
+}
+
+PropertySchema parsePropertySchema(const nlohmann::json& propertyJson) {
+    PropertySchema schema;
+    schema.id = propertyJson.value("id", propertyJson.value("name", std::string{}));
+    schema.label = propertyJson.value("label", schema.id);
+    schema.group = propertyJson.value("group", std::string{});
+    schema.unit = propertyJson.value("unit", std::string{});
+    schema.editor = propertyJson.value("editor", propertyJson.value("type", std::string{"text"}));
+    schema.valueKind = parsePropertyValueKind(propertyJson.value("valueKind", propertyJson.value("type", std::string{"string"})),
+                                              schema.editor);
+
+    if (propertyJson.contains("default")) {
+        schema.defaultValue = jsonToPropertyValue(propertyJson["default"]);
+    } else {
+        switch (schema.valueKind) {
+            case PropertyValueKind::Number: schema.defaultValue = 0.0; break;
+            case PropertyValueKind::Bool: schema.defaultValue = false; break;
+            case PropertyValueKind::Point: schema.defaultValue = PropertyPoint{}; break;
+            case PropertyValueKind::String:
+            default: schema.defaultValue = std::string{}; break;
+        }
+    }
+
+    if (propertyJson.contains("min") && propertyJson["min"].is_number()) schema.minValue = propertyJson["min"].get<double>();
+    if (propertyJson.contains("max") && propertyJson["max"].is_number()) schema.maxValue = propertyJson["max"].get<double>();
+    if (propertyJson.contains("step") && propertyJson["step"].is_number()) schema.step = propertyJson["step"].get<double>();
+    if (propertyJson.contains("options") && propertyJson["options"].is_array()) {
+        for (const auto& optionJson : propertyJson["options"]) {
+            PropertyOption option;
+            if (optionJson.is_object()) {
+                option.value = optionJson.value("value", std::string{});
+                option.label = optionJson.value("label", option.value);
+            } else if (optionJson.is_string()) {
+                option.value = optionJson.get<std::string>();
+                option.label = option.value;
+            }
+            schema.options.push_back(std::move(option));
+        }
+    }
+    schema.flags = parsePropertyFlags(propertyJson);
+    return schema;
+}
+
+std::vector<PropertySchema> parsePropertySchemaList(const nlohmann::json& deviceJson) {
+    std::vector<PropertySchema> schemaList;
+    if (!deviceJson.contains("properties") || !deviceJson["properties"].is_array()) return schemaList;
+    schemaList.reserve(deviceJson["properties"].size());
+    for (const auto& propertyJson : deviceJson["properties"]) {
+        schemaList.push_back(parsePropertySchema(propertyJson));
+    }
+    return schemaList;
+}
+
+// ── serialização pro lado IPC (getPropertySchemas) — inversa de jsonToPropertyValue/
+// parsePropertySchema acima, pra a Webview receber exatamente o que `device.json` já declara pros
+// plugins, agora também pros built-ins (ComponentMetadataRegistry, ver registerBuiltinComponents). ──
+
+nlohmann::json propertyValueToJson(const PropertyValue& value) {
+    if (const double* d = std::get_if<double>(&value)) return *d;
+    if (const std::string* s = std::get_if<std::string>(&value)) return *s;
+    if (const bool* b = std::get_if<bool>(&value)) return *b;
+    const PropertyPoint& point = std::get<PropertyPoint>(value);
+    return nlohmann::json{{"x", point.x}, {"y", point.y}};
+}
+
+const char* propertyValueKindToJson(PropertyValueKind kind) {
+    switch (kind) {
+        case PropertyValueKind::Number: return "number";
+        case PropertyValueKind::Bool: return "bool";
+        case PropertyValueKind::Point: return "point";
+        case PropertyValueKind::String:
+        default: return "string";
+    }
+}
+
+nlohmann::json propertySchemaToJson(const PropertySchema& schema) {
+    nlohmann::json json{
+        {"id", schema.id},
+        {"label", schema.label},
+        {"group", schema.group},
+        {"unit", schema.unit},
+        {"valueKind", propertyValueKindToJson(schema.valueKind)},
+        {"editor", schema.editor},
+        {"default", propertyValueToJson(schema.defaultValue)},
+        {"hidden", (schema.flags & PropertySchemaHidden) != 0},
+        {"readOnly", (schema.flags & PropertySchemaReadOnly) != 0},
+        {"noCopy", (schema.flags & PropertySchemaNoCopy) != 0},
+        {"affectsTopology", (schema.flags & PropertySchemaAffectsTopology) != 0},
+        {"requiresRestart", (schema.flags & PropertySchemaRequiresRestart) != 0},
+        {"showOnSymbol", (schema.flags & PropertySchemaShowOnSymbol) != 0},
+    };
+    if (schema.minValue) json["min"] = *schema.minValue;
+    if (schema.maxValue) json["max"] = *schema.maxValue;
+    if (schema.step) json["step"] = *schema.step;
+    if (!schema.options.empty()) {
+        nlohmann::json options = nlohmann::json::array();
+        for (const PropertyOption& option : schema.options) {
+            options.push_back({{"value", option.value}, {"label", option.label}});
+        }
+        json["options"] = std::move(options);
+    }
+    return json;
+}
+
+/** Resolve `propertySchema` de uma `ComponentMetadata` pra a língua pedida — implementação de
+ * `lasecsimul.spec` seção 6.3.3 (fallback: solicitada → língua-base do manifesto → devolve a base
+ * sem alteração se não houver tradução pra essa língua, nunca string vazia). Caminho rápido (sem cópia
+ * nem parse de JSON) quando a língua pedida já é a língua-base ou não há `translations` nenhuma —
+ * é o caso comum (maioria das chamadas não pede tradução, ou o componente não tem nenhuma). */
+std::vector<PropertySchema> resolvePropertySchemaForLanguage(const registry::ComponentMetadata& meta,
+                                                              const std::string& requestedLanguage) {
+    if (requestedLanguage.empty() || requestedLanguage == meta.language || meta.translationsJson.empty()) {
+        return meta.propertySchema;
+    }
+    nlohmann::json translations;
+    try {
+        translations = nlohmann::json::parse(meta.translationsJson);
+    } catch (const std::exception&) {
+        return meta.propertySchema; // translations malformado -- cai pra língua-base, nunca quebra
+    }
+    if (!translations.contains(requestedLanguage)) return meta.propertySchema;
+    const nlohmann::json& translated = translations[requestedLanguage];
+    const nlohmann::json* properties = translated.contains("properties") ? &translated["properties"] : nullptr;
+
+    std::vector<PropertySchema> resolved = meta.propertySchema; // cópia -- a base nunca é alterada
+    for (PropertySchema& schema : resolved) {
+        if (!properties || !properties->contains(schema.id)) continue;
+        const nlohmann::json& propertyTranslation = (*properties)[schema.id];
+        if (propertyTranslation.contains("label")) schema.label = propertyTranslation.value("label", schema.label);
+        if (propertyTranslation.contains("group")) schema.group = propertyTranslation.value("group", schema.group);
+        if (propertyTranslation.contains("options") && propertyTranslation["options"].is_object()) {
+            for (PropertyOption& option : schema.options) {
+                const nlohmann::json& optionsTranslation = propertyTranslation["options"];
+                if (optionsTranslation.contains(option.value)) {
+                    option.label = optionsTranslation.value(option.value, option.label);
+                }
+            }
+        }
+    }
+    return resolved;
+}
+
+struct ParsedPropertyError {
+    std::string code;
+    std::string message;
+};
+
+ParsedPropertyError parsePropertyError(const std::string& rawError) {
+    const size_t separator = rawError.find('|');
+    if (separator == std::string::npos) return {"unknown_property", rawError};
+    return {rawError.substr(0, separator), rawError.substr(separator + 1)};
+}
+
+/** Parseia `subcircuits/library.json` (lista de `{typeId, manifest}`, mesmo padrão de
+ * `devices/library.json`) e cada `.lssub.json` referenciado, registrando no `SubcircuitRegistry`
+ * da sessão -- ver .spec/lasecsimul-subcircuits.spec, seções 1 e 7. Roda no mesmo verbo IPC
+ * `loadDeviceLibrary` que já existe (seção 6): um `library.json` com `"devices"` cai no caminho de
+ * plugin nativo (`loadDeviceLibraryFile`), um com `"subcircuits"` cai aqui -- os dois são checados
+ * independentemente porque um `library.json` futuro poderia, em tese, ter as duas chaves. */
+void loadSubcircuitLibraryFile(const std::filesystem::path& libraryJsonPath, registry::SubcircuitRegistry& subcircuits) {
+    std::ifstream libraryFile(libraryJsonPath);
+    if (!libraryFile) throw std::runtime_error("library.json não encontrado: " + libraryJsonPath.string());
+    nlohmann::json library;
+    libraryFile >> library;
+
+    if (!library.contains("subcircuits") || !library["subcircuits"].is_array()) return;
+    const std::filesystem::path libraryDir = libraryJsonPath.parent_path();
+
+    for (const auto& entry : library["subcircuits"]) {
+        const std::string typeId = entry.value("typeId", std::string{});
+        const std::string manifestRelative = entry.value("manifest", std::string{});
+        if (typeId.empty() || manifestRelative.empty()) continue;
+
+        const std::filesystem::path manifestPath = libraryDir / manifestRelative;
+        std::ifstream manifestFile(manifestPath);
+        if (!manifestFile) throw std::runtime_error(".lssub.json não encontrado: " + manifestPath.string());
+        nlohmann::json manifest;
+        manifestFile >> manifest;
+
+        registry::SubcircuitDefinition def;
+        def.typeId = typeId;
+        def.name = manifest.value("name", typeId);
+        def.packageJson = manifest.contains("package") ? manifest["package"].dump() : "{}";
+
+        if (manifest.contains("components") && manifest["components"].is_array()) {
+            for (const auto& compJson : manifest["components"]) {
+                registry::SubcircuitComponentDef comp;
+                comp.id = compJson.value("id", std::string{});
+                comp.typeId = compJson.value("typeId", std::string{});
+                comp.propertiesJson = compJson.contains("properties") ? compJson["properties"].dump() : "{}";
+                def.components.push_back(std::move(comp));
+            }
+        }
+        if (manifest.contains("wires") && manifest["wires"].is_array()) {
+            for (const auto& wireJson : manifest["wires"]) {
+                registry::SubcircuitWireDef wire;
+                wire.fromComponentId = wireJson["from"].value("componentId", std::string{});
+                wire.fromPinId = wireJson["from"].value("pinId", std::string{});
+                wire.toComponentId = wireJson["to"].value("componentId", std::string{});
+                wire.toPinId = wireJson["to"].value("pinId", std::string{});
+                def.wires.push_back(std::move(wire));
+            }
+        }
+        if (manifest.contains("interface") && manifest["interface"].is_array()) {
+            for (const auto& ifaceJson : manifest["interface"]) {
+                registry::SubcircuitInterfaceDef iface;
+                iface.pinId = ifaceJson.value("pinId", std::string{});
+                iface.label = ifaceJson.value("label", iface.pinId);
+                iface.internalTunnel = ifaceJson.value("internalTunnel", std::string{});
+                def.interfaceDefs.push_back(std::move(iface));
+            }
+        }
+        subcircuits.registerDefinition(std::move(def));
+    }
+}
+
+#if defined(_WIN32)
+constexpr const char* kPlatformKey = "win32-x64";
+#elif defined(__APPLE__)
+constexpr const char* kPlatformKey = "darwin-universal";
+#else
+constexpr const char* kPlatformKey = "linux-x64";
+#endif
+
+/** Parseia `library.json` (lista de `{typeId, manifest}`), parseia cada `device.json` referenciado,
+ * resolve o binário nativo da plataforma atual e publica no GlobalPluginCache —
+ * `PluginLoader::scanDirectory()` permanece o stub documentado (ver PluginLoader.hpp, "quem chama
+ * scanDirectory é responsável por publicar no GlobalPluginCache"); esta função é esse chamador, só
+ * ainda não existia nenhum. Caminhos em `nativeEntry`/`manifest` são relativos ao arquivo que os
+ * declara (device.json e library.json, respectivamente) — mesma convenção usada por
+ * `npm run build:devices` ao gerar `devices/example-blinker/build/win-x64/device.dll`. */
+void loadDeviceLibraryFile(const std::filesystem::path& libraryJsonPath, GlobalPluginCache& pluginCache) {
+    std::ifstream libraryFile(libraryJsonPath);
+    if (!libraryFile) throw std::runtime_error("library.json não encontrado: " + libraryJsonPath.string());
+    nlohmann::json library;
+    libraryFile >> library;
+
+    if (!library.contains("devices") || !library["devices"].is_array()) return;
+    const std::filesystem::path libraryDir = libraryJsonPath.parent_path();
+
+    for (const auto& deviceEntry : library["devices"]) {
+        const std::string typeId = deviceEntry.value("typeId", std::string{});
+        const std::string manifestRelative = deviceEntry.value("manifest", std::string{});
+        if (typeId.empty() || manifestRelative.empty()) continue;
+
+        const std::filesystem::path manifestPath = libraryDir / manifestRelative;
+        std::ifstream manifestFile(manifestPath);
+        if (!manifestFile) throw std::runtime_error("device.json não encontrado: " + manifestPath.string());
+        nlohmann::json device;
+        manifestFile >> device;
+
+        if (!device.contains("nativeEntry") || !device["nativeEntry"].contains(kPlatformKey)) {
+            throw std::runtime_error("device.json sem nativeEntry para a plataforma atual ('" +
+                                      std::string(kPlatformKey) + "'): " + manifestPath.string());
+        }
+        const std::filesystem::path binaryPath =
+            manifestPath.parent_path() / device["nativeEntry"][kPlatformKey].get<std::string>();
+
+        registry::ComponentMetadata metadata;
+        metadata.typeId = typeId;
+        metadata.displayName = device.value("name", typeId);
+        metadata.propertySchema = parsePropertySchemaList(device);
+        // language é obrigatório por contrato (RNF12 de lasecsimul.spec), mas device.json anterior a
+        // esta rodada não declara -- default "pt-BR" preserva compatibilidade (todo manifesto existente
+        // até aqui foi de fato escrito em português, então o default não está mentindo).
+        metadata.language = device.value("language", std::string{"pt-BR"});
+        if (device.contains("translations")) metadata.translationsJson = device["translations"].dump();
+        if (device.contains("limits") && device["limits"].is_object()) {
+            metadata.stepTimeoutMs = device["limits"].value("stepTimeoutMs", 0u);
+        }
+        if (device.contains("pins") && device["pins"].is_array()) {
+            for (const auto& pinJson : device["pins"]) {
+                Pin pin;
+                pin.id = pinJson.value("id", std::string{});
+                pin.x = pinJson.value("x", 0.0);
+                pin.y = pinJson.value("y", 0.0);
+                metadata.pins.push_back(std::move(pin));
+            }
+        }
+        pluginCache.metadata().registerMetadata(std::move(metadata));
+
+        std::shared_ptr<PluginModule> module = pluginCache.loader().loadDevicePlugin(binaryPath);
+        pluginCache.setActiveDeviceModule(typeId, module);
+    }
+}
+
+} // namespace
+
+namespace {
+
+OutgoingResponse handleMessage(const IncomingMessage& msg, SimulationSession& session,
+                                IpcServer& server, GlobalPluginCache& pluginCache) {
+    OutgoingResponse resp;
+    resp.id = msg.id;
+
+    // ── hello ──────────────────────────────────────────────────────────────────
+    if (msg.type == "hello") {
+        resp.ok = true;
+        resp.payloadJson = R"({"serverVersion":"0.1.0","protocolVersion":)"
+                           + std::to_string(PROTOCOL_VERSION) + "}";
+        return resp;
+    }
+
+    // ── shutdown ───────────────────────────────────────────────────────────────
+    if (msg.type == "shutdown") {
+        session.scheduler().stop();
+        server.shutdown();
+        resp.ok = true;
+        return resp;
+    }
+
+    // ── controle de simulação ──────────────────────────────────────────────────
+    if (msg.type == "start") {
+        session.scheduler().start();
+        resp.ok = true;
+        return resp;
+    }
+    if (msg.type == "pause") {
+        session.scheduler().pause();
+        resp.ok = true;
+        return resp;
+    }
+    if (msg.type == "stop") {
+        session.scheduler().stop();
+        resp.ok = true;
+        return resp;
+    }
+    if (msg.type == "step") {
+        // passo único — não implementado no Scheduler ainda; reservado
+        resp.ok = false;
+        resp.error = "step não implementado";
+        return resp;
+    }
+
+    // ── esquemático: componentes e fios ───────────────────────────────────────
+    if (msg.type == "addComponent") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            ComponentParams params;
+            if (payload.contains("properties") && payload["properties"].is_object()) {
+                for (const auto& [key, value] : payload["properties"].items()) {
+                    params.properties[key] = jsonToPropertyValue(value);
+                }
+            }
+            // IDs/posições de pino vindos da Webview — built-ins ignoram o id daqui (usam um
+            // hardcoded na própria factory, ver registerBuiltinComponents) e só leem a posição,
+            // mas plugins (NativeDeviceProxy) usam ESTES ids diretamente como ComponentMeta::pins
+            // — sem isso, connectWire nunca acertaria o pino certo de um plugin (ver
+            // .spec/lasecsimul.spec sobre instrumentos/plugins ABI).
+            if (payload.contains("pins") && payload["pins"].is_array()) {
+                for (const auto& pinJson : payload["pins"]) {
+                    Pin pin;
+                    pin.id = pinJson.value("id", std::string{});
+                    pin.x = pinJson.value("x", 0.0);
+                    pin.y = pinJson.value("y", 0.0);
+                    params.pinList.push_back(std::move(pin));
+                }
+            }
+            const std::string typeId = payload.value("typeId", std::string{});
+            if (session.isSubcircuitType(typeId)) {
+                // Subcircuito: nem `properties`/`pins` do payload se aplicam (interno já vem fixo
+                // do .lssub.json) — ver .spec/lasecsimul-subcircuits.spec, seção 5.1/6.
+                const session::SubcircuitExpansionResult expansion = session.addSubcircuitInstance(typeId);
+                nlohmann::json exposedPinsJson = nlohmann::json::object();
+                for (const auto& [pinId, exposed] : expansion.exposedPins) {
+                    exposedPinsJson[pinId] = {{"instanceId", std::to_string(exposed.instanceId)}, {"pinId", exposed.pinId}};
+                }
+                resp.ok = true;
+                resp.payloadJson = nlohmann::json{{"instanceId", std::to_string(expansion.subcircuitInstanceId)},
+                                                   {"exposedPins", exposedPinsJson}}
+                                        .dump();
+            } else {
+                const uint32_t instanceId = session.addComponent(typeId, params);
+                resp.ok = true;
+                resp.payloadJson = nlohmann::json{{"instanceId", std::to_string(instanceId)}}.dump();
+            }
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("addComponent falhou: ") + e.what();
+        }
+        return resp;
+    }
+    if (msg.type == "setProperty") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const uint32_t instanceId = static_cast<uint32_t>(std::stoul(payload.value("instanceId", std::string{"0"})));
+            const std::string name = payload.value("name", std::string{});
+            const std::optional<PropertySchema> schema = session.propertySchemaOf(instanceId, name);
+            const std::optional<std::string> error =
+                session.setProperty(instanceId, name, jsonToPropertyValue(payload.at("value")));
+
+            if (error) {
+                const ParsedPropertyError parsed = parsePropertyError(*error);
+                resp.ok = false;
+                resp.error = parsed.message;
+                resp.payloadJson = nlohmann::json{{"errorCode", parsed.code}}.dump();
+            } else {
+                resp.ok = true;
+                if (schema && (schema->flags & PropertySchemaRequiresRestart) != 0) {
+                    resp.payloadJson = nlohmann::json{{"requiresRestart", true}}.dump();
+                }
+            }
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("setProperty falhou: ") + e.what();
+        }
+        return resp;
+    }
+    if (msg.type == "removeComponent") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const uint32_t instanceId = static_cast<uint32_t>(std::stoul(payload.value("instanceId", std::string{"0"})));
+            if (session.isSubcircuitInstance(instanceId)) {
+                session.removeSubcircuitInstance(instanceId); // cascata -- seção 5.4
+            } else {
+                session.removeComponent(instanceId);
+            }
+            resp.ok = true;
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("removeComponent falhou: ") + e.what();
+        }
+        return resp;
+    }
+    // Leitura genérica do estado opaco de QUALQUER instância (built-in ou plugin) — mecanismo único
+    // de "ler de volta" um valor calculado, em vez de um verbo por tipo de componente (ver
+    // .spec/lasecsimul.spec sobre instrumentos como plugin ABI). Quem decide o que os bytes
+    // significam é o chamador (ex: a Extension sabe que "instruments.voltmeter" devolve 8 bytes =
+    // 1 double). Mesma ressalva de concorrência que já existe hoje para addComponent/setProperty/
+    // connectWire/removeComponent enquanto a simulação está rodando: lido na thread de IPC enquanto
+    // o Scheduler pode estar mutando o mesmo IComponentModel na thread dele, sem mutex entre as
+    // duas — não introduzido por este handler, ver docs/mvp-limitacoes.md.
+    if (msg.type == "getComponentState") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const uint32_t instanceId = static_cast<uint32_t>(std::stoul(payload.value("instanceId", std::string{"0"})));
+            const std::vector<uint8_t> state = session.getComponentState(instanceId);
+            static const char kHexDigits[] = "0123456789abcdef";
+            std::string hex;
+            hex.reserve(state.size() * 2);
+            for (uint8_t byte : state) {
+                hex.push_back(kHexDigits[(byte >> 4) & 0xF]);
+                hex.push_back(kHexDigits[byte & 0xF]);
+            }
+            resp.ok = true;
+            resp.payloadJson = nlohmann::json{{"stateHex", hex}}.dump();
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("getComponentState falhou: ") + e.what();
+        }
+        return resp;
+    }
+    // Saúde operacional (watchdog/CrashGuard) de uma instância -- visibilidade pra Extension
+    // decidir se avisa o usuário (.spec/lasecsimul-native-devices.spec seção 13). Só leitura.
+    if (msg.type == "getComponentHealth") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const uint32_t instanceId = static_cast<uint32_t>(std::stoul(payload.value("instanceId", std::string{"0"})));
+            const PluginHealthStatus health = session.componentHealth(instanceId);
+            const char* statusStr = health == PluginHealthStatus::Faulted ? "faulted"
+                                     : health == PluginHealthStatus::Lagging ? "lagging"
+                                                                              : "ok";
+            resp.ok = true;
+            resp.payloadJson = nlohmann::json{{"status", statusStr}}.dump();
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("getComponentHealth falhou: ") + e.what();
+        }
+        return resp;
+    }
+
+    // Leitura de corrente (opção 1 do plano de baixo custo: sem incógnita nova na matriz, lida sob
+    // demanda do estado cacheado na última stamp() de cada componente -- ver
+    // IComponentModel::current()/SimulationSession::componentCurrent). "hasCurrent": false quando o
+    // componente não implementa isso (Ground, Tunnel, etc.) -- nunca erro, a Extension decide se
+    // esconde o valor.
+    if (msg.type == "getComponentCurrent") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const uint32_t instanceId = static_cast<uint32_t>(std::stoul(payload.value("instanceId", std::string{"0"})));
+            const std::optional<double> current = session.componentCurrent(instanceId);
+            resp.ok = true;
+            resp.payloadJson = current
+                ? nlohmann::json{{"hasCurrent", true}, {"current", *current}}.dump()
+                : nlohmann::json{{"hasCurrent", false}}.dump();
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("getComponentCurrent falhou: ") + e.what();
+        }
+        return resp;
+    }
+
+    if (msg.type == "sendComponentEvent") {
+        try {
+            const nlohmann::json payload = nlohmann::json::parse(msg.payloadJson.empty() ? "{}" : msg.payloadJson);
+            const uint32_t instanceId = std::stoul(payload.value("instanceId", "0"));
+            ComponentEvent event;
+            event.tag = payload.value("tag", 0u);
+            event.a = payload.value("a", 0u);
+            event.b = payload.value("b", 0u);
+            event.c = payload.value("c", 0u);
+            session.sendComponentEvent(instanceId, event);
+            resp.ok = true;
+            resp.payloadJson = R"({"delivered":true})";
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("sendComponentEvent falhou: ") + e.what();
+        }
+        return resp;
+    }
+    // Tensão atual do nó ao qual o pino `pinId` da instância `instanceId` está resolvido -- usado
+    // pela Extension pra colorir/animar fios na Webview (vermelho/azul conforme tensão, ver
+    // SimulIDE ConnectorLine::paint) sem precisar que cada fio seja "lido" via um instrumento. Só
+    // leitura (nunca muda topologia/estado) — mesma ressalva de concorrência de getComponentState.
+    if (msg.type == "getNodeVoltage") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const uint32_t instanceId = static_cast<uint32_t>(std::stoul(payload.value("instanceId", std::string{"0"})));
+            const std::string pinId = payload.value("pinId", std::string{});
+            const double voltage = session.nodeVoltageOfPin(instanceId, pinId);
+            resp.ok = true;
+            resp.payloadJson = nlohmann::json{{"voltage", voltage}}.dump();
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("getNodeVoltage falhou: ") + e.what();
+        }
+        return resp;
+    }
+    // Schema de propriedades por typeId (grupo/editor/min/max/opções/flags) — built-in (registrado em
+    // registerBuiltinComponents) OU plugin (registrado por loadDeviceLibraryFile a partir do
+    // device.json) — `ComponentMetadataRegistry` é a MESMA fonte pros dois, sem distinção aqui. Só
+    // leitura, sem payload de entrada; devolve tudo que já está registrado neste momento (chamar de
+    // novo depois de um loadDeviceLibrary pega os typeIds novos também).
+    if (msg.type == "getPropertySchemas") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            // Sem "language" no payload (ou igual à língua-base de cada componente): devolve tudo na
+            // língua-base de cada um, idêntico ao comportamento de antes desta resolução existir --
+            // "language" é só um pedido de tradução, nunca obrigatório (ver lasecsimul.spec seção 6.3.3).
+            const std::string requestedLanguage = payload.value("language", std::string{});
+            nlohmann::json schemasByTypeId = nlohmann::json::object();
+            for (const auto& [typeId, meta] : pluginCache.metadata().all()) {
+                const std::vector<PropertySchema> resolved = resolvePropertySchemaForLanguage(meta, requestedLanguage);
+                nlohmann::json schemas = nlohmann::json::array();
+                for (const PropertySchema& schema : resolved) {
+                    schemas.push_back(propertySchemaToJson(schema));
+                }
+                schemasByTypeId[typeId] = std::move(schemas);
+            }
+            resp.ok = true;
+            resp.payloadJson = nlohmann::json{{"schemasByTypeId", schemasByTypeId}}.dump();
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("getPropertySchemas falhou: ") + e.what();
+        }
+        return resp;
+    }
+    if (msg.type == "loadDeviceLibrary") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const std::string libraryPath = payload.value("path", std::string{});
+            loadDeviceLibraryFile(libraryPath, pluginCache);
+            loadSubcircuitLibraryFile(libraryPath, session.subcircuits());
+            // Reaplica: registra factory pra qualquer typeId que ficou ativo agora (chamar de novo
+            // é idempotente — só reatribui no map, ver ComponentRegistry::registerFactory).
+            session.registerKnownPluginTypes();
+            session.registerKnownMcuTypes();
+            resp.ok = true;
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("loadDeviceLibrary falhou: ") + e.what();
+        }
+        return resp;
+    }
+    if (msg.type == "connectWire") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const uint32_t componentA = static_cast<uint32_t>(std::stoul(payload.value("componentA", std::string{"0"})));
+            const uint32_t componentB = static_cast<uint32_t>(std::stoul(payload.value("componentB", std::string{"0"})));
+            session.connectWire(componentA, payload.value("pinIdA", std::string{}), componentB,
+                                 payload.value("pinIdB", std::string{}));
+            resp.ok = true;
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("connectWire falhou: ") + e.what();
+        }
+        return resp;
+    }
+
+    // ── mensagem desconhecida ──────────────────────────────────────────────────
+    resp.ok = false;
+    resp.error = "tipo de mensagem desconhecido: " + msg.type;
+    return resp;
+}
+
+} // namespace
+
+// ── CoreApplication ────────────────────────────────────────────────────────────
+
+CoreApplication::CoreApplication(CoreConfig config)
+    : m_impl(std::make_unique<Impl>(std::move(config))) {
+    registerBuiltinComponents(m_impl->session.components(), m_impl->pluginCache.metadata(), m_impl->session.scheduler());
+    m_impl->session.registerKnownPluginTypes();
+    m_impl->session.registerKnownMcuTypes();
+    registerBuiltinMcuAdapters(m_impl->session.mcus());
+
+    m_impl->ipcServer.setMessageHandler([this](const IncomingMessage& msg) {
+        return handleMessage(msg, m_impl->session, m_impl->ipcServer, m_impl->pluginCache);
+    });
+}
+
+CoreApplication::~CoreApplication() = default;
+
+int CoreApplication::run() {
+    std::fprintf(stderr, "[Core] IPC escutando em '%s'\n", m_impl->config.pipeName.c_str());
+    return m_impl->ipcServer.run();
+}
+
+// ── parsing de argumentos ──────────────────────────────────────────────────────
+
+CoreConfig parseArgs(int argc, char** argv) {
+    CoreConfig cfg;
+    for (int i = 1; i < argc - 1; ++i) {
+        if (std::strcmp(argv[i], "--pipe") == 0) {
+            cfg.pipeName = argv[i + 1];
+            return cfg;
+        }
+    }
+    std::fprintf(stderr, "Uso: lasecsimul-core --pipe <nome-do-pipe>\n");
+    std::exit(1);
+}
+
+} // namespace lasecsimul::app

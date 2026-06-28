@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lasecsimul.dev/schema/lsproj.schema.json",
+  "title": "LasecSimul Project",
+  "type": "object",
+  "required": ["schemaVersion", "components", "wires", "visual", "simulationSettings"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "typeId", "properties"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "typeId": { "type": "string", "minLength": 1 },
+          "properties": { "type": "object" },
+          "visual": {
+            "type": "object",
+            "properties": {
+              "x": { "type": "number" },
+              "y": { "type": "number" },
+              "rotation": { "enum": [0, 90, 180, 270] }
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "wires": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "from", "to"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "from": {
+            "type": "object",
+            "required": ["componentId", "pinId"],
+            "properties": {
+              "componentId": { "type": "string", "minLength": 1 },
+              "pinId": { "type": "string", "minLength": 1 }
+            }
+          },
+          "to": {
+            "type": "object",
+            "required": ["componentId", "pinId"],
+            "properties": {
+              "componentId": { "type": "string", "minLength": 1 },
+              "pinId": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "visual": {
+      "type": "object",
+      "required": ["components", "wires", "viewport"],
+      "properties": {
+        "components": { "type": "array" },
+        "wires": { "type": "array" },
+        "viewport": {
+          "type": "object",
+          "required": ["x", "y", "zoom"],
+          "properties": {
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "zoom": { "type": "number" }
+          }
+        }
+      }
+    },
+    "simulationSettings": { "type": "object" },
+    "mcuFirmware": { "type": "array" }
+  },
+  "additionalProperties": true
+}

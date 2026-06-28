@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "publisher": "lasecsimul-core-team",
+  "trust": "first-party",
+  "version": "0.1.0",
+  "license": "MIT",
+  "devices": [
+    { "typeId": "example.blinker", "manifest": "example-blinker/device.json" },
+    { "typeId": "instruments.voltmeter", "manifest": "voltmeter/device.json" },
+    { "typeId": "outputs.ssd1306", "manifest": "simulide-complex/ssd1306.json" },
+    { "typeId": "outputs.sh1107", "manifest": "simulide-complex/sh1107.json" },
+    { "typeId": "outputs.hd44780", "manifest": "simulide-complex/hd44780.json" },
+    { "typeId": "outputs.aip31068_i2c", "manifest": "simulide-complex/aip31068_i2c.json" },
+    { "typeId": "outputs.ili9341", "manifest": "simulide-complex/ili9341.json" },
+    { "typeId": "outputs.st7735", "manifest": "simulide-complex/st7735.json" },
+    { "typeId": "outputs.st7789", "manifest": "simulide-complex/st7789.json" },
+    { "typeId": "outputs.gc9a01a", "manifest": "simulide-complex/gc9a01a.json" },
+    { "typeId": "outputs.pcf8833", "manifest": "simulide-complex/pcf8833.json" },
+    { "typeId": "outputs.pcd8544", "manifest": "simulide-complex/pcd8544.json" },
+    { "typeId": "outputs.ks0108", "manifest": "simulide-complex/ks0108.json" },
+    { "typeId": "outputs.max72xx_matrix", "manifest": "simulide-complex/max72xx_matrix.json" },
+    { "typeId": "outputs.ws2812", "manifest": "simulide-complex/ws2812.json" },
+    { "typeId": "outputs.servo", "manifest": "simulide-complex/servo.json" },
+    { "typeId": "outputs.audio_out", "manifest": "simulide-complex/audio_out.json" },
+    { "typeId": "passive.transformer", "manifest": "simulide-complex/transformer.json" },
+    { "typeId": "active.diac", "manifest": "simulide-complex/diac.json" },
+    { "typeId": "active.scr", "manifest": "simulide-complex/scr.json" },
+    { "typeId": "active.triac", "manifest": "simulide-complex/triac.json" },
+    { "typeId": "active.bjt", "manifest": "simulide-complex/bjt.json" },
+    { "typeId": "active.mosfet", "manifest": "simulide-complex/mosfet.json" },
+    { "typeId": "active.jfet", "manifest": "simulide-complex/jfet.json" }
+  ],
+  "checksums": {
+    "example-blinker/build/win-x64/device.dll": "PREENCHER_NO_BUILD_SHA256",
+    "voltmeter/build/win-x64/device.dll": "PREENCHER_NO_BUILD_SHA256"
+  }
+}

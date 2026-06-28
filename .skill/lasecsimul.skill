@@ -1,0 +1,206 @@
+---
+name: lasecsimul-development
+description: Habilidade para desenvolver o LasecSimul — simulador de circuitos eletrônicos com extensão VSCode (TS) + núcleo nativo C++, MCUs emulados via QEMU, dispositivos extensíveis via plugin nativo DLL/SO. Referência técnica em .spec/lasecsimul.spec e .spec/lasecsimul-native-devices.spec.
+applies_to: LasecSimul/**
+---
+
+# Skill: Desenvolvimento do LasecSimul
+
+## Identidade e escopo
+
+Esta skill orienta qualquer agente que implemente código dentro de `LasecSimul/`. O projeto tem **dois
+processos**, não um:
+
+- `LasecSimul/extension/` — TypeScript, VSCode Extension Host. Só UI/orquestração: webview do esquemático,
+  painéis, comandos. **Nunca** calcula eletricidade nem gerencia QEMU diretamente.
+- `LasecSimul/core/` — C++ nativo, processo separado. Dono do `MnaSolver`, `Scheduler`, registries, carregamento
+  de plugins e integração QEMU. **Nunca** referencia a API do VSCode.
+
+Dentro do Core, duas unidades não devem ser confundidas: `GlobalPluginCache` (processo-wide, só leitura após
+o load — código de plugin, metadados) e `SimulationSession` (por projeto aberto — hoje sempre uma por
+processo; o tipo existe para não virar singleton implícito, não porque sessões múltiplas sejam suportadas).
+`Netlist`/`Scheduler`/`BusController`/`PluginRuntime`/`QemuProcessManager` pertencem à sessão, nunca ao cache.
+
+Especificações fonte de verdade, nesta ordem de leitura:
+1. [`.spec/lasecsimul.spec`](../.spec/lasecsimul.spec) (v0.2+) — arquitetura geral, os dois processos, IPC, fluxos.
+2. [`.spec/lasecsimul-native-devices.spec`](../.spec/lasecsimul-native-devices.spec) — sistema de plugins nativos (dispositivos e MCUs).
+
+`.spec/lasecsimul-wasm-devices.spec` está marcado **SUPERSEDED** — é registro histórico de uma abordagem
+descartada (WASM + worker_threads). Nunca usar como referência de implementação; se algo nesta skill parecer
+remeter a WASM/worker, é desatualizado — confiar nos dois `.spec` acima.
+
+## Regras inegociáveis
+
+1. Microcontroladores **nunca** são simulados com código de emulação manual. Todo MCU é um processo QEMU
+   real, controlado via `IMcuAdapter` (built-in ou plugin nativo) + `QemuProcessManager` + `QemuArenaBridge`,
+   dentro do processo Core.
+2. Dispositivos eletrônicos e adaptadores de MCU adicionais **nunca** usam WASM, worker_threads, ou qualquer
+   sandbox de processo/linguagem. O único mecanismo de extensão é plugin nativo (DLL/SO) — descoberto/carregado
+   pelo `PluginLoader` em `GlobalPluginCache`, instanciado pelo `PluginRuntime` de cada sessão, conforme
+   `lasecsimul-native-devices.spec`. Isso foi uma decisão deliberada (velocidade nativa > isolamento de
+   memória), **avaliada e reconfirmada** (inclusive a opção de isolar plugins problemáticos em processo
+   próprio foi considerada e recusada) — não reintroduzir sandboxing/isolamento por processo "por segurança"
+   sem alinhar com o usuário de novo, pois contradiz uma decisão já tomada duas vezes.
+3. Caminho crítico do solver (`stamp`/`postStep`/resolução da matriz) nunca cruza IPC. Se uma tarefa parecer
+   exigir isso (ex: "fazer X chamar a extensão a cada passo de simulação"), é sinal de que X pertence ao
+   Core, não à Extension.
+4. **Nunca descarregar um `PluginModule` com instâncias vivas.** Atualizar um plugin é sempre *versioned
+   swap* (carregar a nova versão lado a lado, só novas instâncias usam; a antiga descarrega sozinha via
+   `shared_ptr` quando sua última instância morrer) — nunca "descarrega e recarrega o mesmo módulo". Ver
+   `lasecsimul-native-devices.spec`, seção 3.
+5. **Todo MCU passa por QEMU, sem exceção — inclusive famílias que o SimulIDE-dev simula manualmente (AVR,
+   PIC).** Antes de prometer suporte a uma família de chip nova, verificar se existe target de CPU pra ela
+   no QEMU (checar o fork em `G:\Meu Drive\SourceCode\qemu-simulide-1\target\` e `hw\`, não assumir de
+   memória) — se não existir, é dependência externa que falta, não tarefa deste projeto. PIC está
+   formalmente fora de escopo por esse motivo (ver `lasecsimul.spec`, seção 8.2).
+
+## Como agir por tipo de tarefa
+
+- **Componente da biblioteca padrão** (mantido pelo projeto) → nova classe C++ em
+  `core/src/components/<categoria>/`, implementando `IComponentModel` diretamente, compilada no binário do
+  Core. Ver `lasecsimul.spec` seção 9 e exemplo 12.1.
+- **Dispositivo de terceiros/comunidade** → plugin nativo: pasta com `device.json` + binário exportando
+  `lsdn_get_vtable` (ABI C de `device_abi.h`). Seguir `lasecsimul-native-devices.spec` seções 14-18
+  (estrutura, manifesto, build, empacotamento). Nunca pedir para o usuário recompilar o Core. O código
+  carregado é um `PluginModule` (em `GlobalPluginCache`, compartilhado); cada colocação no esquemático é uma
+  `PluginInstance` (`NativeDeviceProxy`, criada pelo `PluginRuntime` da sessão) — não confundir os dois ciclos
+  de vida nem fazer `PluginRuntime` saber como carregar binário (isso é do `PluginLoader`).
+- **UI precisa de schema/ícone/propriedades de um `typeId`** → consultar `ComponentMetadataRegistry`
+  (`GlobalPluginCache`), nunca instanciar via `ComponentRegistry` só para ler metadado.
+- **Corpo visual/pinos desenhados de um device (não a parte elétrica)** → bloco `package` dentro do mesmo
+  `device.json` (`lasecsimul-native-devices.spec`, seção 21) — nunca um arquivo/formato separado (sem XML,
+  sem SVG externo; imagem de fundo é embutida como string no próprio JSON). É lido só pela Extension; o Core
+  nunca processa `package`. Um eventual "editor de pacote" é o mesmo webview do esquemático com um modo
+  especial — não uma ferramenta nova.
+- **Novo MCU** → mesma lógica: `IMcuAdapter` built-in (compilado no Core) ou plugin nativo
+  (`LsdnMcuVTable`). Verificar se a build de QEMU alvo expõe GPIO por canal externo antes de prometer
+  suporte — se não expõe, é dependência externa (patch de QEMU), não responsabilidade do Core.
+- **Alteração no `MnaSolver`/`Scheduler`** → só se nenhuma interface existente (`IComponentModel`,
+  `IMcuAdapter`, `IBusParticipant`) cobre o caso. Confirmar antes que o problema não é resolvível como
+  plugin ou componente novo (OCP).
+- **Fronteira de plugin (`device_abi.h`, `LsdnHostApi`, `LsdnDeviceVTable`)** → qualquer mudança aqui é
+  mudança de ABI pública; bump de `LSDN_ABI_VERSION_MAJOR`/`MINOR` conforme a regra da seção 4 do
+  `lasecsimul-native-devices.spec`, nunca alteração silenciosa de assinatura.
+- **Carregamento/confiança de plugin (`TrustStore`, consentimento)** → decisão de confiar num publisher é
+  sempre da Extension (UI), nunca do Core. Não implementar lógica de "confiar automaticamente" no Core.
+- **UI/webview** → não acessar o Core diretamente; toda comunicação passa por `CoreClient`
+  (`extension/src/ipc/`), nunca por import direto de módulos do Core.
+- **Depuração de firmware** → integra-se ao gdbserver exposto pelo QEMU diretamente do VSCode, não passa
+  pelo Core.
+
+## Convenções de código
+
+**Core (C++)**:
+- Interfaces (`IComponentModel`, `IMcuAdapter`, `IBusParticipant`) são classes abstratas puras em
+  `core/include/lasecsimul/`.
+- Nenhum tipo C++ (STL, exceções, RTTI) cruza a fronteira de um plugin — só a ABI C de `device_abi.h`.
+  `extern "C"`, calling convention da plataforma, structs `Lsdn*` só com tipos POD de tamanho fixo.
+- `stamp()` só é chamado quando o componente está "dirty" (changed-list do `Scheduler`); nunca implementar
+  um caminho que re-stampe todo componente em todo passo — esse é exatamente o gargalo que a arquitetura
+  evita (ver changelog do `lasecsimul.spec`).
+- Sem dependência de Qt no Core (ver RNF05 do `.spec`); dependências mínimas listadas ali (libuv,
+  nlohmann::json, Eigen) — não adicionar uma nova dependência externa sem checar se a stdlib/uma dessas já cobre.
+- **`MnaSolver` usa `Eigen` para álgebra linear — nunca fatoração escrita à mão.** `Eigen::PartialPivLU`
+  (denso, com pivoteamento) por grupo/componente-conectado; `Eigen::SparseLU` é o caminho de upgrade quando
+  um grupo crescer, não algo a implementar preventivamente. Ver `lasecsimul.spec`, seção 7.1.
+- **Fonte de tensão ideal usa variável extra alocada no rebuild de topologia (`Netlist::rebuildTopology`),
+  nunca durante `stamp()`** — alocar lá faria a matriz crescer a cada round do settle-loop. Capacitor/indutor
+  não precisam disso (modelo de companhia Norton, via `rhs()`); só componente com restrição tipo fonte ideal
+  declara `extraVariableCount() > 0`. Ver `lasecsimul.spec`, seção 7.3.
+- **Todo grupo sem `Ground` é singular por construção** (KCL somada em todos os nós sempre zera — é
+  redundância estrutural do MNA, não bug). Qualquer circuito de teste/exemplo precisa de uma referência de
+  terra, não só de fonte — esquecer isso dá fallback silencioso pra 0V (seção 12 do
+  `lasecsimul-native-devices.spec`), não erro óbvio.
+- **Componente não-linear é `isNonlinear()`/`hasConverged()` (seção 7.4 do `.spec`) — nenhum existe ainda.**
+  O Scheduler só fornece o laço de repetição e o limite de iterações; matemática de linearização (diodo,
+  transistor) é do componente concreto. Não inventar uma segunda forma de "pedir mais uma iteração" fora
+  desse contrato.
+- **`SparseSet`/`ScheduledEvent` tinham dois bugs reais corrigidos**: capacidade fixa sem crescer (UB acima
+  do limite) e falta de desempate por mesmo `timeNs` (não-determinismo entre execuções). Qualquer estrutura
+  de dirty-tracking/fila nova segue o mesmo padrão já corrigido, não reintroduz nenhum dos dois.
+- **Editar componente já existente (painel de propriedades) é `PropertyDescriptor`/`propertyDescriptors()`
+  (seção 6.1 do `.spec`), nunca um `if`/`switch` por `typeId` em `SimulationSession`.** `Tunnel` é exceção
+  deliberada (não expõe "name" por aqui — precisa de `setTunnelName`, que rebuilda topologia). Plugin nativo
+  ainda não participa (`device_abi.h` não tem `set_property`) — não fingir que funciona pra plugin sem essa
+  função existir na ABI.
+- **Futuro `I2cBusModule`/`SpiBusModule` (ainda não implementado, ver `lasecsimul-native-devices.spec`
+  seção 8.2): master agendado por evento, slave puramente reativo a mudança de pino — nunca os dois
+  agendados.** Vocabulário de estado neutro (nunca emprestar encoding de registrador de uma família de
+  chip específica). Recebe `Scheduler` por injeção no construtor, nunca por singleton/`self()`.
+- **Dirty-tracking e fila de eventos do `Scheduler` usam estrutura plana, nunca ponteiro intrusivo
+  (`next`)**: `SparseSet` (array denso + índice esparso) para "quem está dirty agora"; `std::priority_queue`
+  para eventos agendados por tempo. O SimulIDE usa listas ligadas intrusivas nesses dois pontos — decisão
+  consciente de não copiar ali: pointer-chasing é pior pra cache em CPUs atuais que um array contíguo. Ver
+  tabela de decisões em `lasecsimul.spec`, seção 7.1.
+- **`MnaSolver` resolve grupos (componentes galvanicamente conectados) em paralelo no thread-pool do Core
+  quando há mais de um grupo dirty** — divergência deliberada do SimulIDE (que nunca paraleliza o solve).
+  Seguro porque grupos não compartilham estado mutável por construção; não generalizar pra paralelizar
+  dentro de uma única matriz grande, isso é um problema diferente e mais arriscado, fora de escopo agora.
+- Antes de tocar em `MnaSolver`/`CircuitGroup`/`Scheduler`, ler `circmatrix.{h,cpp}`/`e-node.h`/
+  `simulator.cpp` do SimulIDE-dev — mas **não copiar às ciegas**: a tabela da seção 7.1 do `lasecsimul.spec`
+  já separou o que é técnica atemporal (adotar) do que é provável limitação de projeto solo de 2012 (LU sem
+  pivoteamento, nunca paralelizar, lista intrusiva) — essa tabela é a referência, não o código do SimulIDE
+  diretamente.
+- **UI da Extension segue a organização de painéis do SimulIDE real (seção 13 do `.spec`), exceto qualquer
+  área de digitar/compilar código — essa não existe no LasecSimul.** Compilação é sempre externa; o Core só
+  lê o artefato (`.bin`/`.elf`/`.hex`) já pronto (seção 8.3). Também não replicar o `FileWidget` (navegador de
+  arquivo) nem nenhum diálogo de arquivo próprio — o VSCode já cobre os dois nativamente. Paleta de
+  componentes é `TreeView` nativo do VSCode, não webview (já tem busca/filtro de fábrica). Propriedades é
+  painel persistente, nunca modal — SimulIDE usa `QDialog` ali, decisão deliberada de não copiar porque modal
+  interrompe o fluxo.
+- **Firmware é vigiado por pasta, recarrega sozinho — nunca exige ação manual como o `slotReload()` do
+  SimulIDE (confirmado: zero uso de `QFileSystemWatcher` em todo o projeto real).** `FirmwareWatcher` (seção
+  8.3 do `.spec`) faz polling de `mtime` (não API de evento nativa por SO — simplicidade deliberada, latência
+  de 1-2s é aceitável); ao detectar mudança, reaproveita o mesmo kill+respawn já especificado pro pino de
+  reset (seção 8, item 10). Recarregar firmware nunca é caminho de código separado de "reset".
+- **Cross-platform é checado a cada trecho de código gerado, não só revisado depois (RNF07).** Antes de
+  escrever uma chamada de API, perguntar se ela é específica de SO; se for, isolar num shim
+  `#ifdef _WIN32`/POSIX no próprio arquivo (padrão de `PluginLoader.cpp`/`CrashGuard.cpp`), nunca espalhar a
+  divergência pelo código de domínio. Mentalmente compilar para os três alvos antes de considerar a tarefa
+  pronta.
+- **Integração com QEMU (I2C/SPI/USART/GPIO/IRQ) segue o mecanismo já validado pelo SimulIDE-dev, não uma
+  ideia nova**: arena de memória compartilhada + dispatch por faixa de endereço + módulo de barramento
+  genérico reusado por qualquer chip — nunca pino-a-pino, nunca protocolo reimplementado por adaptador. Antes
+  de tocar em `QemuArenaBridge`/`IMcuAdapter`/módulos de barramento, ler
+  `SimulIDE-dev/src/microsim/cores/qemu/{qemudevice,qemumodule,qemutwi,qemuspi}.{h,cpp}` e
+  `SimulIDE-dev/src/microsim/modules/twi/twimodule.h` — são a referência de comportamento, não só inspiração.
+- **`BusController` nunca sabe o nome de um chip ou de um plugin** — só endereço (I2C) ou CS (SPI). Se uma
+  mudança parecer exigir `if (chipFamily == ...)`/`if (typeId == ...)` ali, a lógica pertence ao
+  `IMcuAdapter`/`I2cBusModule`/`SpiBusModule`, não ao `BusController` (`lasecsimul-native-devices.spec`, seção 8).
+- **ABI (`device_abi.h`/`mcu_abi.h`) tem regras de ownership e thread-affinity fixas, não implícitas**:
+  buffers de saída são sempre pré-alocados por quem lê; nenhum ponteiro de parâmetro é válido após a chamada
+  retornar; nenhuma função de `LsdnHostApi` pode ser chamada de uma thread que o host não controla. Qualquer
+  função nova na ABI segue essas regras por padrão — não é preciso (nem deve) reabrir essa discussão por
+  função. Ver `lasecsimul-native-devices.spec`, seção 4.1.
+- **Telemetria é lossy por padrão (descarta a mais antiga), eventos discretos não são**: ao adicionar um novo
+  tipo de evento (ex: novo estado de instrumento), decidir explicitamente se ele vai no ring buffer
+  (telemetria contínua, pode perder) ou no canal de controle (entrega garantida) — nunca assumir um dos dois
+  por padrão. Ver RNF09 do `lasecsimul.spec`.
+
+**Extension (TypeScript)**:
+- Nenhum cálculo elétrico ou de simulação — só UI, IPC, e metadados de exibição
+  (`ComponentDisplayMeta`).
+- Toda comunicação com o Core passa por `CoreClient`; nunca abrir socket/pipe fora dele.
+
+**Em ambos**: nenhum módulo de `components/`, `devices/`, `mcu-adapters/`, `ui/` importa outro desses
+diretamente — comunicação cruzada só via registries/interfaces do Core ou via `CoreClient` na Extension.
+
+## Quando algo não está no `.spec`
+
+Procedimento obrigatório, nesta ordem, pra **qualquer agente** (incluindo sub-agentes despachados a partir de
+`tasks/agent-*.md`) sempre que a tarefa exigir implementar algo que o `.spec` ainda não cobre:
+
+1. **Procurar uma solução real** — não implementar a primeira ideia que ocorrer. Considerar pelo menos uma
+   alternativa antes de decidir.
+2. **Avaliar como o SimulIDE-dev resolve o mesmo problema**, mesmo que a resposta final seja não copiar —
+   é a referência concreta deste projeto, não uma opção qualquer entre várias. Registrar o porquê de adotar,
+   adaptar ou rejeitar (mesmo padrão das tabelas já usadas nas seções 7.1/8.2/13 do `lasecsimul.spec`).
+3. **Se sobrar dúvida real** (trade-off não óbvio, ambiguidade de escopo, ou qualquer decisão que toque o
+   modelo de confiança/isolamento de plugins — seção 0 e 12 do `lasecsimul-native-devices.spec`, que já é
+   sempre decisão do usuário): **perguntar ao usuário antes de implementar.** Não decidir por adivinhação.
+4. **Se não sobrar dúvida** depois dos passos 1-2: implementar a melhor solução **e atualizar o `.spec`
+   relevante na mesma tarefa** — nunca implementar e deixar a decisão só no código. O `.spec` é o que o
+   próximo agente lê primeiro; uma decisão que existe só no código se perde na primeira reescrita.
+
+Isso vale tanto pra lacuna técnica pequena (ex: qual estrutura de dado usar) quanto pra decisão de produto
+maior (ex: novo painel de UI) — a única coisa que muda é o tamanho da seção de spec que o passo 4 produz.

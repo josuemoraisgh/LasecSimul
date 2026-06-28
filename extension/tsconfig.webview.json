@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "outDir": "out-webview",
+    "rootDir": "src/ui/webview",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "sourceMap": true
+  },
+  "include": [
+    "src/ui/webview/main.ts",
+    "src/ui/webview/messages.ts",
+    "src/ui/webview/model.ts",
+    "src/ui/webview/componentSymbols.ts",
+    "src/ui/webview/wireGeometry.ts",
+    "src/ui/webview/valueFormatting.ts"
+  ]
+}

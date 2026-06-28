@@ -1,0 +1,74 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+*.temp
+
+# VS Code
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# Node / TypeScript
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+extension/node_modules/
+extension/out/
+extension/out-test/
+extension/out-webview/
+*.tsbuildinfo
+
+# CMake / Ninja
+cmake-build-*/
+build/
+build-*/
+build_*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+.ninja_deps
+.ninja_log
+build.ninja
+Testing/
+_deps/
+
+# Projeto: builds conhecidos
+/core/build/
+/core/build-*/
+/core/build_*/
+/core/build-probe/
+/core/build-codex/
+/core/build-codex2/
+/core/build_trash*/
+/devices/*/build/
+/devices/*/build_cmake/
+/mcu-adapters/*/build/
+
+# Binarios / objetos
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.lib
+*.dll
+*.dll.a
+*.so
+*.so.*
+*.dylib
+*.exe
+*.exp
+*.ilk
+*.pdb
+
+# Pacotes e caches locais opcionais
+/devices/qemu-esp32/bin/

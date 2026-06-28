@@ -1,0 +1,283 @@
+#pragma once
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include "CircuitGroup.hpp"
+#include "UnionFind.hpp"
+
+namespace lasecsimul::simulation {
+
+/** Onde um pino (slot global) caiu depois da resolução de topologia. */
+struct PinSlotResolution {
+    uint32_t groupIndex; // índice em Topology::groups
+    uint32_t localIndex; // linha/coluna dentro daquele CircuitGroup
+};
+
+/** Onde a(s) variável(is) extra(s) — corrente de ramo — de um componente caiu. Só populado para
+ * componentes com extraVariableCount() > 0 (ver .spec/lasecsimul.spec, seção 7.3). */
+struct ExtraVariableResolution {
+    uint32_t groupIndex;
+    uint32_t baseLocalIndex; // primeira linha/coluna de variável extra deste componente, no grupo
+};
+
+/** Um pino específico de um componente específico, presente num nó — usado pra disparar
+ * `ComponentEvent{kPinChangeEventTag,...}` quando esse nó cruza o limiar digital (ver
+ * SimulationSession::settleStep()). `localPinIndex` = posição do pino na ordem de declaração
+ * (mesmo índice que `IComponentModel::pins()`/a ABI de plugin usam) -- NUNCA o slot global. */
+struct NodePinRef {
+    uint32_t componentIndex;
+    uint32_t localPinIndex;
+};
+
+struct Topology {
+    std::vector<CircuitGroup> groups;
+    std::vector<PinSlotResolution> resolutionBySlot;    // por slot de pino -> grupo + índice local
+    std::vector<std::vector<uint32_t>> listenersByNode; // por nó global -> componentIndex interessados (dedup)
+    /** Por nó global -> TODOS os (componente, pino-local) ali presentes, SEM dedup (um componente
+     * com 2 pinos no mesmo nó aparece 2x, cada vez com seu próprio localPinIndex) -- diferente de
+     * `listenersByNode`, que só serve pra marcar dirty (dedup é o correto ali). */
+    std::vector<std::vector<NodePinRef>> pinRefsByNode;
+    std::vector<uint32_t> slotToNode;                   // por slot -> nó global (pós passada 1)
+    std::vector<ExtraVariableResolution> extraVariablesByComponent; // por componentIndex (se > 0 vars)
+};
+
+/**
+ * Grafo de nós do circuito, sempre achatado (subcircuitos/devices aninhados nunca geram matriz
+ * própria — ver .spec/lasecsimul.spec, seção 7.1). Resolve topologia em duas passadas de
+ * `UnionFind`, sempre do zero — nunca incremental, porque união não é desfazível (renomear um
+ * túnel pode separar nós que estavam fundidos) e topologia só muda em edição do usuário, nunca no
+ * caminho crítico de simulação (ver seção 7.2):
+ *
+ *   Passada 1 (pino -> nó): une slots conectados por fio OU por nome de túnel compartilhado.
+ *   Passada 2 (nó -> grupo): cada componente une os nós dos seus PRÓPRIOS pinos entre si — é
+ *   isso que forma os `CircuitGroup` (sistemas lineares independentes, ver seção 7.1).
+ *
+ * Variáveis extras (correntes de ramo de fonte de tensão ideal, seção 7.3) são alocadas na MESMA
+ * passada de rebuild, depois das linhas de nó de cada grupo — nunca durante stamp().
+ */
+class Netlist {
+public:
+    /** Aloca um slot de nó por pino do componente. Devolve o slot global por id local de pino
+     * (ex: "p1") — quem chama (SimulationSession) guarda isso pra montar o ComponentMatrixView
+     * de cada componente depois de rebuildTopology(). */
+    const std::unordered_map<std::string, uint32_t>& registerComponent(
+        uint32_t componentIndex, const std::vector<std::string>& pinIds) {
+        if (componentIndex != m_componentPinSlots.size())
+            throw std::invalid_argument("Netlist::registerComponent: componentIndex must be dense");
+
+        // Slots de um componente são sempre alocados em sequência contígua, na ordem de `pinIds`
+        // (uma única chamada, um push por iteração) -- por isso `localPinIndex` de um slot é
+        // derivável sem guardar a lista ordenada de novo: `slot - m_firstSlotByComponent[owner]`.
+        m_firstSlotByComponent.push_back(static_cast<uint32_t>(m_slotOwner.size()));
+
+        std::unordered_map<std::string, uint32_t> slotsByPinId;
+        for (const std::string& pinId : pinIds) {
+            if (pinId.empty()) throw std::invalid_argument("Netlist::registerComponent: empty pin id");
+            if (slotsByPinId.find(pinId) != slotsByPinId.end())
+                throw std::invalid_argument("Netlist::registerComponent: duplicate pin id");
+
+            const uint32_t slot = static_cast<uint32_t>(m_slotOwner.size());
+            m_slotOwner.push_back(componentIndex);
+            m_tunnelNameBySlot.emplace_back();
+            slotsByPinId.emplace(pinId, slot);
+        }
+        m_componentPinSlots.push_back(std::move(slotsByPinId));
+        m_componentRemoved.push_back(false);
+        return m_componentPinSlots.back();
+    }
+
+    /** Remove logicamente o componente `componentIndex`: desconecta todos os fios que tocam seus
+     * pinos, limpa nome de túnel deles e marca o componente como removido — rebuildTopology() passa
+     * a ignorar seus slots (não formam nó/grupo/listener novos). O índice NUNCA é reciclado:
+     * registerComponent() exige componentIndex == size() (denso e crescente), então reaproveitar um
+     * buraco exigiria recompactar todos os índices já distribuídos à Extension/Webview — fora de
+     * escopo (ver docs/mvp-limitacoes.md). Idempotente: remover de novo não falha. */
+    void removeComponent(uint32_t componentIndex) {
+        if (componentIndex >= m_componentPinSlots.size())
+            throw std::out_of_range("Netlist::removeComponent: invalid component index");
+        if (m_componentRemoved[componentIndex]) return;
+
+        for (const auto& [pinId, slot] : m_componentPinSlots[componentIndex]) {
+            (void)pinId;
+            if (!m_tunnelNameBySlot[slot].empty()) setTunnelName(slot, m_tunnelNameBySlot[slot], "");
+            const auto touchesSlot = [slot](const auto& edge) { return edge.first == slot || edge.second == slot; };
+            m_wireEdges.erase(std::remove_if(m_wireEdges.begin(), m_wireEdges.end(), touchesSlot),
+                               m_wireEdges.end());
+        }
+        m_componentRemoved[componentIndex] = true;
+    }
+
+    bool isComponentRemoved(uint32_t componentIndex) const { return m_componentRemoved.at(componentIndex); }
+
+    void connectWire(uint32_t slotA, uint32_t slotB) {
+        validateSlot(slotA, "Netlist::connectWire");
+        validateSlot(slotB, "Netlist::connectWire");
+        m_wireEdges.emplace_back(slotA, slotB);
+    }
+
+    bool disconnectWire(uint32_t slotA, uint32_t slotB) {
+        validateSlot(slotA, "Netlist::disconnectWire");
+        validateSlot(slotB, "Netlist::disconnectWire");
+        const auto matches = [slotA, slotB](const auto& edge) {
+            return (edge.first == slotA && edge.second == slotB) ||
+                   (edge.first == slotB && edge.second == slotA);
+        };
+        const auto it = std::find_if(m_wireEdges.begin(), m_wireEdges.end(), matches);
+        if (it == m_wireEdges.end()) return false;
+        m_wireEdges.erase(it);
+        return true;
+    }
+
+    /** Túnel: associa/reassocia/desassocia um slot a um nome. Por sessão (esta Netlist), nunca
+     * estático/global — dois projetos abertos nunca compartilham nomes de túnel por acidente
+     * (decisão deliberada vs. o `static QMap` do SimulIDE — ver .spec, seção 7.2). */
+    void setTunnelName(uint32_t slot, const std::string& oldName, const std::string& newName) {
+        (void)oldName; // Estado real fica nesta Netlist; o parametro antigo existe para compatibilidade.
+        validateSlot(slot, "Netlist::setTunnelName");
+
+        std::string& currentName = m_tunnelNameBySlot[slot];
+        if (currentName == newName) return;
+
+        if (!currentName.empty()) {
+            auto it = m_tunnelGroups.find(currentName);
+            if (it != m_tunnelGroups.end()) {
+                auto& slots = it->second;
+                slots.erase(std::remove(slots.begin(), slots.end(), slot), slots.end());
+                if (slots.empty()) m_tunnelGroups.erase(it);
+            }
+        }
+        currentName = newName;
+        if (!newName.empty()) m_tunnelGroups[newName].push_back(slot);
+    }
+
+    const std::unordered_map<std::string, uint32_t>& pinSlotsOf(uint32_t componentIndex) const {
+        return m_componentPinSlots.at(componentIndex);
+    }
+
+    /** Recomputa tudo do zero — só deve ser chamado quando a topologia muda (fio/túnel/componente
+     * adicionado ou removido), nunca a cada passo de simulação. `extraVarCountByComponent` (mesma
+     * ordem/índice de componentIndex que registerComponent) vem de
+     * `IComponentModel::extraVariableCount()` — Netlist não conhece IComponentModel, então quem
+     * chama (SimulationSession) é responsável por essa consulta antes de chamar isto. */
+    Topology rebuildTopology(const std::vector<uint32_t>& extraVarCountByComponent = {}) const {
+        const size_t slotCount = m_slotOwner.size();
+
+        // Passada 1: pino/slot -> nó global
+        UnionFind pinUnion(slotCount);
+        for (const auto& [a, b] : m_wireEdges) {
+            validateSlot(a, "Netlist::rebuildTopology");
+            validateSlot(b, "Netlist::rebuildTopology");
+            pinUnion.unite(a, b);
+        }
+        for (const auto& [name, slots] : m_tunnelGroups) {
+            (void)name;
+            if (!slots.empty()) validateSlot(slots[0], "Netlist::rebuildTopology");
+            for (size_t i = 1; i < slots.size(); ++i) {
+                validateSlot(slots[i], "Netlist::rebuildTopology");
+                pinUnion.unite(slots[0], slots[i]);
+            }
+        }
+        const std::vector<uint32_t> slotToNode = pinUnion.compress();
+        const size_t nodeCount = pinUnion.idCount();
+
+        // Passada 2: nó -> grupo (mesmo componente => mesmo grupo). Componente removido não tem
+        // mais pinos vivos — não deve fundir nós nem aparecer em grupo/listener algum.
+        UnionFind groupUnion(nodeCount);
+        for (size_t componentIndex = 0; componentIndex < m_componentPinSlots.size(); ++componentIndex) {
+            if (m_componentRemoved[componentIndex]) continue;
+            const std::unordered_map<std::string, uint32_t>& slotsByPinId = m_componentPinSlots[componentIndex];
+            uint32_t firstNode = std::numeric_limits<uint32_t>::max();
+            for (const auto& [pinId, slot] : slotsByPinId) {
+                (void)pinId;
+                const uint32_t node = slotToNode[slot];
+                if (firstNode == std::numeric_limits<uint32_t>::max()) firstNode = node;
+                else groupUnion.unite(firstNode, node);
+            }
+        }
+        const std::vector<uint32_t> nodeToGroup = groupUnion.compress();
+        const size_t groupCount = groupUnion.idCount();
+
+        // Monta os nós (em ordem local) de cada grupo + resolução nó -> (grupo, índice local)
+        std::vector<std::vector<uint32_t>> nodesPerGroup(groupCount);
+        for (uint32_t node = 0; node < nodeCount; ++node) nodesPerGroup[nodeToGroup[node]].push_back(node);
+
+        std::vector<PinSlotResolution> resolutionByNode(nodeCount);
+        for (uint32_t g = 0; g < groupCount; ++g) {
+            for (uint32_t local = 0; local < nodesPerGroup[g].size(); ++local) {
+                resolutionByNode[nodesPerGroup[g][local]] = {g, local};
+            }
+        }
+
+        // Variáveis extras: por componente, soma no grupo a que pertence (qualquer um dos seus
+        // nós serve — passada 2 garante que todos caem no mesmo grupo). Base = nodeCount do grupo
+        // + quanto já foi reservado antes deste componente, na ordem de componentIndex.
+        std::vector<uint32_t> extraCountPerGroup(groupCount, 0);
+        std::vector<ExtraVariableResolution> extraVariablesByComponent(m_componentPinSlots.size(), {0, 0});
+        for (size_t componentIndex = 0; componentIndex < m_componentPinSlots.size(); ++componentIndex) {
+            if (m_componentRemoved[componentIndex]) continue;
+            const uint32_t needed = componentIndex < extraVarCountByComponent.size()
+                                         ? extraVarCountByComponent[componentIndex]
+                                         : 0;
+            if (needed == 0) continue;
+            const auto& slotsByPinId = m_componentPinSlots[componentIndex];
+            if (slotsByPinId.empty()) continue;
+            const uint32_t anyNode = slotToNode[slotsByPinId.begin()->second];
+            const uint32_t group = nodeToGroup[anyNode];
+
+            extraVariablesByComponent[componentIndex] = {
+                group, static_cast<uint32_t>(nodesPerGroup[group].size() + extraCountPerGroup[group])};
+            extraCountPerGroup[group] += needed;
+        }
+
+        Topology topology;
+        topology.groups.reserve(groupCount); // zero realloc -- CircuitGroup não precisa ser barato de mover
+        for (uint32_t g = 0; g < groupCount; ++g)
+            topology.groups.emplace_back(nodesPerGroup[g], extraCountPerGroup[g]);
+
+        topology.resolutionBySlot.resize(slotCount);
+        for (uint32_t slot = 0; slot < slotCount; ++slot)
+            topology.resolutionBySlot[slot] = resolutionByNode[slotToNode[slot]];
+
+        topology.listenersByNode.resize(nodeCount);
+        for (uint32_t slot = 0; slot < slotCount; ++slot) {
+            if (m_componentRemoved[m_slotOwner[slot]]) continue; // removido nunca volta a ser dirty
+            topology.listenersByNode[slotToNode[slot]].push_back(m_slotOwner[slot]);
+        }
+        for (std::vector<uint32_t>& listeners : topology.listenersByNode) {
+            std::sort(listeners.begin(), listeners.end());
+            listeners.erase(std::unique(listeners.begin(), listeners.end()), listeners.end());
+        }
+
+        topology.pinRefsByNode.resize(nodeCount);
+        for (uint32_t slot = 0; slot < slotCount; ++slot) {
+            const uint32_t owner = m_slotOwner[slot];
+            if (m_componentRemoved[owner]) continue; // removido nunca volta a receber evento de pino
+            const uint32_t localPinIndex = slot - m_firstSlotByComponent[owner];
+            topology.pinRefsByNode[slotToNode[slot]].push_back({owner, localPinIndex});
+        }
+
+        topology.slotToNode = slotToNode;
+        topology.extraVariablesByComponent = std::move(extraVariablesByComponent);
+        return topology;
+    }
+
+private:
+    void validateSlot(uint32_t slot, const char* operation) const {
+        if (slot >= m_slotOwner.size()) throw std::out_of_range(std::string(operation) + ": invalid pin slot");
+    }
+
+    std::vector<uint32_t> m_slotOwner;                                    // slot -> componentIndex
+    std::vector<uint32_t> m_firstSlotByComponent;                         // componentIndex -> 1o slot dele
+    std::vector<std::unordered_map<std::string, uint32_t>> m_componentPinSlots; // por componente: pinId -> slot
+    std::vector<std::pair<uint32_t, uint32_t>> m_wireEdges;
+    std::unordered_map<std::string, std::vector<uint32_t>> m_tunnelGroups;
+    std::vector<std::string> m_tunnelNameBySlot;
+    std::vector<bool> m_componentRemoved; // por componente: true se removeComponent() já foi chamado
+};
+
+} // namespace lasecsimul::simulation

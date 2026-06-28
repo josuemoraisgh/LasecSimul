@@ -1,0 +1,102 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "ninja-multi",
+      "displayName": "Ninja Multi-Config (Windows/Linux/macOS)",
+      "description": "Generator portável entre as três plataformas-alvo (RNF07); requer compilador C/C++ e Ninja no PATH (em Windows, abrir um prompt com ambiente MSVC carregado, ex: 'Developer Command Prompt for VS').",
+      "inherits": "base",
+      "generator": "Ninja Multi-Config"
+    },
+    {
+      "name": "windows-msvc",
+      "displayName": "Windows (Visual Studio 2019, x64)",
+      "description": "Usa o gerador de projeto do Visual Studio; resolve o ambiente do MSVC automaticamente, sem precisar de vcvarsall manual.",
+      "inherits": "base",
+      "generator": "Visual Studio 16 2019",
+      "architecture": { "value": "x64" },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "linux-default",
+      "displayName": "Linux (Ninja)",
+      "inherits": "base",
+      "generator": "Ninja Multi-Config",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "macos-default",
+      "displayName": "macOS (Ninja)",
+      "inherits": "base",
+      "generator": "Ninja Multi-Config",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "ninja-multi-debug",
+      "configurePreset": "ninja-multi",
+      "configuration": "Debug"
+    },
+    {
+      "name": "ninja-multi-release",
+      "configurePreset": "ninja-multi",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-msvc-debug",
+      "configurePreset": "windows-msvc",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-msvc-release",
+      "configurePreset": "windows-msvc",
+      "configuration": "Release"
+    },
+    {
+      "name": "linux-default-debug",
+      "configurePreset": "linux-default",
+      "configuration": "Debug"
+    },
+    {
+      "name": "macos-default-debug",
+      "configurePreset": "macos-default",
+      "configuration": "Debug"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "ninja-multi-debug",
+      "configurePreset": "ninja-multi",
+      "configuration": "Debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "windows-msvc-debug",
+      "configurePreset": "windows-msvc",
+      "configuration": "Debug",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "components": [
+    {
+      "id": "gnd1",
+      "typeId": "other.ground",
+      "properties": {},
+      "visual": { "x": 120, "y": 280, "rotation": 0 }
+    },
+    {
+      "id": "v1",
+      "typeId": "sources.dc_voltage",
+      "properties": { "voltage": 5 },
+      "visual": { "x": 120, "y": 160, "rotation": 0 }
+    },
+    {
+      "id": "r1",
+      "typeId": "passive.resistor",
+      "properties": { "resistance": 1000 },
+      "visual": { "x": 280, "y": 160, "rotation": 0 }
+    }
+  ],
+  "wires": [
+    { "id": "w1", "from": { "componentId": "v1", "pinId": "p1" }, "to": { "componentId": "r1", "pinId": "p1" } },
+    { "id": "w2", "from": { "componentId": "r1", "pinId": "p2" }, "to": { "componentId": "gnd1", "pinId": "pin" } },
+    { "id": "w3", "from": { "componentId": "v1", "pinId": "p2" }, "to": { "componentId": "gnd1", "pinId": "pin" } }
+  ],
+  "visual": {
+    "components": [],
+    "wires": [],
+    "viewport": { "x": 0, "y": 0, "zoom": 1 }
+  },
+  "simulationSettings": {
+    "frequencyHz": 1000,
+    "timeScale": 1,
+    "paused": false
+  }
+}

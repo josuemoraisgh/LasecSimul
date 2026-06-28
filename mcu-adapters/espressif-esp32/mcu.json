@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "chipId": "espressif.esp32",
+  "name": "Espressif ESP32 (QEMU)",
+  "abiVersion": { "major": 1, "minor": 0 },
+  "nativeEntry": {
+    "win32-x64": "build/win-x64/adapter.dll",
+    "linux-x64": "build/linux-x64/adapter.so",
+    "darwin-universal": "build/macos-universal/adapter.dylib"
+  },
+  "qemuBinary": "qemu-system-xtensa",
+  "machine": "esp32",
+  "qemuBuild": {
+    "required": true,
+    "description": "Requer build modificado de QEMU para ESP32/Xtensa com arena de memoria compartilhada para eventos de registrador. QEMU stock nao e suficiente.",
+    "arenaContract": "QemuProcessManager fornece a chave da arena ao processo QEMU; o adapter declara apenas binario, maquina, firmware, regioes MMIO e pinos."
+  },
+  "firmware": {
+    "expectedFormats": [".bin", ".elf"],
+    "launchArgument": "-kernel",
+    "pathPolicy": "Fornecido pelo usuario/projeto em runtime; o manifesto nao deve conter path local hardcoded."
+  },
+  "memoryRegions": [
+    { "start": "0x3FF44000", "end": "0x3FF44FFF", "moduleKind": "GPIO", "moduleIndex": 0 },
+    { "start": "0x3FF53000", "end": "0x3FF53FFF", "moduleKind": "I2C", "moduleIndex": 0 },
+    { "start": "0x3FF64000", "end": "0x3FF64FFF", "moduleKind": "SPI", "moduleIndex": 0 },
+    { "start": "0x3FF40000", "end": "0x3FF40FFF", "moduleKind": "USART", "moduleIndex": 0 }
+  ],
+  "pinMap": {
+    "GPIO2": { "moduleKind": "GPIO", "moduleIndex": 0, "bit": 2 },
+    "UART0_TX": { "moduleKind": "USART", "moduleIndex": 0, "line": "tx" },
+    "UART0_RX": { "moduleKind": "USART", "moduleIndex": 0, "line": "rx" }
+  }
+}

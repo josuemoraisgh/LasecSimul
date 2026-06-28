@@ -1,0 +1,573 @@
+:root {
+  color-scheme: light;
+  --bg: #eef1f4;
+  --panel: #f7f8fa;
+  --panel-2: #ffffff;
+  --line: #c9d1da;
+  --text: #2a3340;
+  --muted: #6b7786;
+  --accent: #c69217;
+  --accent-2: #1c8fb7;
+  --danger: #c65252;
+  --toolbar-bg: #ecece4;
+  --toolbar-line: #c8c8c8;
+  --toolbar-text: #20242a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: linear-gradient(180deg, #f7f8fa 0%, #eef1f4 100%);
+  color: var(--text);
+  font-family: "Segoe UI", "Trebuchet MS", sans-serif;
+}
+
+#app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.appbar {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 40px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--toolbar-line);
+  background: var(--toolbar-bg);
+  color: var(--toolbar-text);
+}
+
+.appbar__group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 10px;
+  border-right: 1px solid #d2d2ca;
+}
+
+.appbar__group:last-of-type {
+  border-right: none;
+  padding-right: 0;
+}
+
+.appbar__button {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid #a9abb0;
+  border-radius: 3px;
+  background: linear-gradient(#ffffff, #d8d9dc);
+  color: #555b64;
+  cursor: pointer;
+  padding: 0;
+}
+
+.appbar__button:hover:not(:disabled) {
+  border-color: #7f8794;
+  background: linear-gradient(#ffffff, #cfd3da);
+}
+
+.appbar__button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.appbar__button--start {
+  color: #d94848;
+}
+
+.appbar__button--pause {
+  color: #7a5d08;
+}
+
+.appbar__button--stop {
+  color: #6f747d;
+}
+
+.appbar__button--delete {
+  color: #a53f3f;
+}
+
+.appbar__button--properties {
+  color: #365f8a;
+}
+
+.appbar__button--open,
+.appbar__button--save {
+  color: #4d5969;
+}
+
+.appbar__icon {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+}
+
+.appbar__button--pause .appbar__icon,
+.appbar__button--stop .appbar__icon {
+  fill: currentColor;
+}
+
+.appbar__meta {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.appbar__selection {
+  min-width: 0;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: #4b5058;
+}
+
+.appbar__status {
+  min-width: 92px;
+  padding: 5px 12px;
+  text-align: center;
+  background: #ff9900;
+  color: #fff;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.appbar__status--running {
+  background: #318a46;
+}
+
+.appbar__status--paused {
+  background: #7e8794;
+}
+
+.canvas {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  background-color: #e6eaef;
+  background-image:
+    linear-gradient(rgba(120, 134, 150, 0.12) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(120, 134, 150, 0.12) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/** Viewport fixo (`.canvas`) nunca se move/escala; este wrapper recebe `translate()`+`scale()` via JS
+ * (zoom por scroll, ver `main.ts`) -- todo conteúdo do esquemático mora aqui, não direto em `.canvas`. */
+.canvas-content {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  transform-origin: 0 0;
+}
+
+/** Retângulo de seleção por arrasto (marquee) -- overlay em coordenadas de TELA (relativas a
+ * `.canvas`), nunca dentro de `.canvas-content` (não deve escalar com o zoom). */
+.marquee-rect {
+  position: absolute;
+  border: 1px dashed var(--accent);
+  background: rgba(110, 168, 254, 0.12);
+  pointer-events: none;
+}
+
+.wire-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.wire-layer__wire {
+  stroke: var(--muted);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  cursor: pointer;
+  pointer-events: visibleStroke;
+}
+
+.wire-layer__wire--high {
+  stroke: rgb(200, 50, 50);
+}
+
+.wire-layer__wire--low {
+  stroke: rgb(50, 50, 200);
+}
+
+.wire-layer__wire--selected {
+  stroke-width: 5;
+  filter: drop-shadow(0 0 3px rgba(244, 185, 66, 0.9));
+}
+
+.wire-layer__wire--preview {
+  stroke: var(--accent);
+  stroke-dasharray: 6 5;
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+.wire-layer__segment-handle {
+  stroke: transparent;
+  stroke-width: 16;
+  fill: none;
+  pointer-events: visibleStroke;
+}
+
+.wire-layer__segment-handle--horizontal {
+  cursor: ns-resize;
+}
+
+.wire-layer__segment-handle--vertical {
+  cursor: ew-resize;
+}
+
+.wire-layer__segment-highlight {
+  stroke: #f4b942;
+  stroke-width: 7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  pointer-events: none;
+  filter: drop-shadow(0 0 3px rgba(244, 185, 66, 0.9));
+}
+
+.wire-layer__corner-handle {
+  fill: #eef5ff;
+  stroke: #5b7fd1;
+  stroke-width: 1.5;
+  cursor: move;
+}
+
+.wire-layer__corner-handle--selected {
+  fill: #f4b942;
+  stroke: #8a6208;
+  stroke-width: 2;
+}
+
+.component {
+  position: absolute;
+  user-select: none;
+  cursor: grab;
+}
+
+.component.dragging {
+  cursor: grabbing;
+}
+
+.component__symbol {
+  display: block;
+  width: 100%;
+  height: 100%;
+  color: var(--text);
+  overflow: visible;
+  transform-origin: center center;
+}
+
+.component--voltmeter .component__symbol {
+  color: #d9e2f3;
+}
+
+.symbol-stroke {
+  stroke: currentColor;
+  stroke-width: 2;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.symbol-stroke--thick {
+  stroke-width: 3;
+}
+
+.symbol-stroke--accent {
+  stroke: var(--accent-2);
+}
+
+.symbol-text {
+  fill: currentColor;
+  font-size: 13px;
+  font-weight: 700;
+  stroke: none;
+}
+
+.symbol-text--accent {
+  fill: var(--accent-2);
+}
+
+.pin-terminal {
+  fill: var(--accent-2);
+  stroke: var(--bg);
+  stroke-width: 1;
+  cursor: crosshair;
+}
+
+.pin-terminal:hover {
+  fill: var(--accent);
+  r: 6.5;
+}
+
+.pin-terminal--active {
+  fill: var(--accent);
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.selection-overlay {
+  fill: var(--text);
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+/** Nome com índice (ex: "Resistor-1") perto do símbolo -- mesma convenção de cor do SimulIDE
+ * (`Component::m_idLabel`, azul-escuro), mostrado só quando `WebviewComponentModel.showId` é true. */
+.component__id-label {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  margin-bottom: 2px;
+  white-space: nowrap;
+  color: #5b7fd1;
+  font-size: 11px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+/** Valor formatado da propriedade `showOnSymbol` (ex: "1 kΩ") ou leitura ao vivo (ex: voltímetro) --
+ * mesma convenção de cor do SimulIDE (`Component::m_valLabel`, vermelho-escuro), mostrado quando
+ * `WebviewComponentModel.showValue` é true (default calculado, ver `findShowOnSymbolSchema`). */
+.component__value-label {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 2px;
+  white-space: nowrap;
+  color: #c0594a;
+  font-size: 11px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.junction-dot {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f4b942;
+  box-shadow: 0 0 0 1px #101114;
+  pointer-events: none;
+}
+
+.property-dialog {
+  min-width: 360px;
+  max-width: 420px;
+  padding: 0;
+  border: 1px solid #b8b8b8;
+  border-radius: 8px;
+  background: #efefef;
+  color: #202020;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.42);
+}
+
+.property-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.property-sheet {
+  display: grid;
+  gap: 10px;
+  padding: 0 10px 10px;
+}
+
+.property-sheet__titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 -10px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #d2d2d2;
+  background: linear-gradient(#f8f8f8, #ebebeb);
+}
+
+.property-sheet__uid {
+  font-size: 13px;
+  color: #6f6f6f;
+}
+
+.property-sheet__window-close {
+  width: 24px;
+  height: 24px;
+  border: 1px solid #cfcfcf;
+  background: #e1e1e1;
+  color: #8b8b8b;
+  cursor: pointer;
+}
+
+.property-sheet__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 6px;
+}
+
+.property-sheet__type {
+  color: #1847c7;
+  font-size: 18px;
+}
+
+.property-sheet__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.property-sheet__button {
+  min-width: 76px;
+  height: 28px;
+  border: 1px solid #b5b5b5;
+  border-radius: 3px;
+  background: linear-gradient(#fdfdfd, #dfdfdf);
+  color: #202020;
+}
+
+.property-sheet__show-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: #252525;
+}
+
+.property-sheet__title-row,
+.property-sheet__field-row {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: #212121;
+}
+
+.property-sheet__title-row input,
+.property-sheet__field-input {
+  height: 28px;
+  padding: 4px 8px;
+  border: 1px solid #b8b8b8;
+  background: #fff;
+  color: #202020;
+}
+
+.property-sheet__tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.property-sheet__tab {
+  min-width: 86px;
+  padding: 7px 12px;
+  border: 1px solid #bababa;
+  border-bottom: none;
+  border-top-left-radius: 4px;
+  border-top-right-radius: 4px;
+  background: linear-gradient(#efefef, #dadada);
+  color: #222;
+  cursor: pointer;
+}
+
+.property-sheet__tab--active {
+  background: #f7f7f7;
+}
+
+.property-sheet__pages {
+  border: 1px solid #bababa;
+  background: #f7f7f7;
+  min-height: 190px;
+  padding: 12px;
+}
+
+.property-sheet__group {
+  margin: 0;
+  padding: 0;
+  border: none;
+  display: grid;
+  gap: 12px;
+}
+
+.property-sheet__check-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  color: #1d1d1d;
+}
+
+.property-sheet__check-row input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
+.property-sheet__empty {
+  margin: 0;
+  color: #6c6c6c;
+  font-size: 13px;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 30;
+  min-width: 150px;
+  padding: 4px;
+  border: 1px solid #b8b8b8;
+  background: #f0f0f0;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+
+.context-menu__item {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  background: transparent;
+  color: #202020;
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-menu__item:hover:not(:disabled) {
+  background: #dce8ff;
+}
+
+.context-menu__item:disabled {
+  color: #8d8d8d;
+  cursor: default;
+}

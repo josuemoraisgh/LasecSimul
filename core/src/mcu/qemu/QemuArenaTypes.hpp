@@ -1,0 +1,45 @@
+#pragma once
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include "lasecsimul/Types.hpp"
+#include "lasecsimul/qemu_arena_abi.h"
+
+namespace lasecsimul::mcu::qemu {
+
+struct QemuArenaOpenOptions {
+    std::string name;
+    bool createIfMissing = true;
+};
+
+/** Cópia dos campos da `LsdnQemuArena` no momento do `poll()` -- ver qemu_arena_abi.h pro
+ * protocolo completo (registrador bruto: regAddr/regData, SIM_READ/SIM_WRITE, IRQ). */
+struct QemuArenaEvent {
+    uint64_t simuTimePs = 0;
+    uint64_t qemuTimePs = 0;
+    uint64_t regData = 0;
+    uint64_t regAddr = 0;
+    uint64_t irqNumber = 0;
+    uint64_t irqLevel = 0;
+    uint64_t simuAction = 0;
+    int64_t loopTimeoutNs = 0;
+    double psPerInst = 0.0;
+    bool running = false;
+};
+
+struct QemuDispatchResult {
+    bool matched = false;
+    MemoryRegion region;
+    std::string error;
+};
+
+struct QemuPollResult {
+    bool hasEvent = false;
+    std::optional<QemuArenaEvent> event;
+    std::optional<QemuDispatchResult> dispatch;
+    std::string error;
+};
+
+} // namespace lasecsimul::mcu::qemu
+
