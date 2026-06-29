@@ -98,9 +98,9 @@ export class CoreClient {
     typeId: string,
     properties: Record<string, unknown>,
     pins: Array<{ id: string; x: number; y: number }> = []
-  ): Promise<string> {
+  ): Promise<{ instanceId: string; primaryMcuInstanceId?: string }> {
     const resp = await this.request("addComponent", { typeId, properties, pins });
-    return (resp as { instanceId: string }).instanceId;
+    return resp as { instanceId: string; primaryMcuInstanceId?: string };
   }
 
   /** `requiresRestart: true` quando a propriedade alterada tem essa flag no schema (`Core` já
@@ -161,6 +161,15 @@ export class CoreClient {
   async getNodeVoltage(instanceId: string, pinId: string): Promise<number> {
     const resp = await this.request("getNodeVoltage", { instanceId, pinId });
     return (resp as { voltage: number }).voltage;
+  }
+
+  async loadMcuFirmware(instanceId: string, firmwarePath: string, qemuBinaryOverride?: string): Promise<void> {
+    await this.request("loadMcuFirmware", { instanceId, firmwarePath, qemuBinaryOverride });
+  }
+
+  async getMcuLogs(instanceId: string): Promise<string> {
+    const resp = await this.request("getMcuLogs", { instanceId });
+    return (resp as { logs: string }).logs;
   }
 
   /** Schema rico de propriedades (grupo/editor/min/max/opções/flags) de TODO typeId já registrado

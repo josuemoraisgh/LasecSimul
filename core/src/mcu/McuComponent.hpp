@@ -49,9 +49,11 @@ public:
      * não exposto, ver pendência em CoreApplication.cpp). `arenaName` deve ser único por
      * instância (várias MCUs no mesmo projeto = várias arenas, nunca uma global -- ver
      * McuRuntimeManager, ainda não implementado). */
-    void loadFirmware(const std::filesystem::path& firmwarePath, const std::string& arenaName);
+    void loadFirmware(const std::filesystem::path& firmwarePath, const std::string& arenaName,
+                      const std::string& qemuBinaryOverride = {});
     void stopFirmware();
     bool firmwareRunning() const { return m_processManager.isRunning(); }
+    std::string qemuLogs() const { return m_processManager.logs(); }
 
     /** Estado do pino RST (ModuleKind::Reset, ex: EN do ESP32) na última stamp() -- exposto só pra
      * teste confirmar a borda sem precisar reler tensão de matriz. */

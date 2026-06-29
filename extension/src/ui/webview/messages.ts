@@ -110,6 +110,9 @@ export type WebviewToHostMessage =
    * `sourceId` é o mesmo `RegisteredSource.id` que o botão "✎" da paleta já usa -- reaproveita
    * `extension.ts::editPackageSymbolCommand` tal qual, só com outro ponto de entrada. */
   | { version: number; type: "requestEditSymbol"; sourceId: string }
+  | { version: number; type: "requestChooseMcuFirmware"; componentId: string }
+  | { version: number; type: "requestReloadMcuFirmware"; componentId: string }
+  | { version: number; type: "requestOpenMcuSerialMonitor"; componentId: string; usartIndex: 0 | 1 | 2 }
   /** Toggle "Ver: Físico / Símbolo Lógico" na barra da sessão de autoria -- descarta sem salvar a
    * vista atual (mesmo aviso já mostrado na UI, ver `main.ts::toggleLogicSymbolView`) e reabre a
    * sessão semeada a partir da OUTRA chave (`package`/`logicSymbolPackage`), preservando o circuito

@@ -9,6 +9,7 @@ export const defaultComponentCatalog: WebviewComponentCatalogEntry[] = [
   { typeId: "sources.dc_voltage", label: "Fonte de Tensao", category: "Fontes", folderPath: ["Fontes"], icon: "fonte-de-tensao", pinCount: 2, defaultProperties: { voltage: 5 } },
   { typeId: "other.ground", label: "Terra (0 V)", category: "Fontes", folderPath: ["Fontes"], icon: "terra", pinCount: 1, defaultProperties: {} },
   { typeId: "logic.button", label: "Botao", category: "Interruptores", folderPath: ["Interruptores"], icon: "botao", pinCount: 2, defaultProperties: { pressed: false } },
+  { typeId: "instruments.voltmeter", label: "Voltimetro", category: "Medidores", folderPath: ["Medidores"], icon: "voltimetro", pinCount: 3, defaultProperties: {} },
   { typeId: "passive.resistor", label: "Resistor", category: "Passivos", subcategory: "Resistores", folderPath: ["Passivos", "Resistores"], icon: "resistor", pinCount: 2, defaultProperties: { resistance: 1000 } },
   { typeId: "passive.capacitor", label: "Capacitor", category: "Passivos", subcategory: "Reativo", folderPath: ["Passivos", "Reativo"], icon: "capacitor", pinCount: 2, defaultProperties: { capacitance: 1e-6 } },
   { typeId: "passive.inductor", label: "Indutor", category: "Passivos", subcategory: "Reativo", folderPath: ["Passivos", "Reativo"], icon: "inductor", pinCount: 2, defaultProperties: { inductance: 1e-3 } },

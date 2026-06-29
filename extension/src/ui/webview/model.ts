@@ -212,6 +212,12 @@ export interface WebviewComponentCatalogEntry {
   registeredSourceId?: string;
   /** False quando o item é integrado ao catálogo base e não pode ser removido pela UI. */
   registeredSourceRemovable?: boolean;
+  /** Tipo da fonte registrada que originou esta entrada -- usado pela Webview para ajustar menu
+   * de contexto ("Abrir Subcircuito" vs "Editar Símbolo") e ações específicas de MCU/QEMU. */
+  registeredSourceKind?: "abi-device" | "mcu-adapter" | "subcircuit-file";
+  /** `true` quando esta entrada representa um MCU direto (`mcu-adapter`) OU um subcircuito que
+   * hospeda um MCU interno (ex: DevKit/WROOM com ESP32 QEMU dentro). */
+  mcuHost?: boolean;
 }
 
 export interface WebviewProjectState {

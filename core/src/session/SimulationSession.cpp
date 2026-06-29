@@ -234,17 +234,20 @@ SubcircuitExpansionResult SimulationSession::expandSubcircuit(const std::string&
     std::unordered_map<std::string, uint32_t> componentIndexByLocalId;
     std::vector<uint32_t> childComponentIndices;
     std::vector<uint32_t> childSubcircuitIds; // subcircuitos aninhados, pra cascata de remoção
+    std::optional<uint32_t> primaryMcuInstanceId;
 
     for (const registry::SubcircuitComponentDef& compDef : def->components) {
         if (isSubcircuitType(compDef.typeId)) {
             const SubcircuitExpansionResult nested = expandSubcircuit(compDef.typeId, expansionStack);
             childSubcircuitIds.push_back(nested.subcircuitInstanceId);
+            if (!primaryMcuInstanceId && nested.primaryMcuInstanceId) primaryMcuInstanceId = nested.primaryMcuInstanceId;
             continue; // sem componentIndexByLocalId pra ele: wires nunca miram um subcircuito direto
         }
         const registry::ComponentParams params = paramsFromPropertiesJson(compDef.propertiesJson);
         const uint32_t childIndex = addComponent(compDef.typeId, params);
         componentIndexByLocalId[compDef.id] = childIndex;
         childComponentIndices.push_back(childIndex);
+        if (!primaryMcuInstanceId && m_mcus.contains(compDef.typeId)) primaryMcuInstanceId = childIndex;
 
         if (compDef.typeId == "connectors.tunnel") {
             const std::string internalName = tunnelNameFromPropertiesJson(compDef.propertiesJson);
@@ -283,7 +286,7 @@ SubcircuitExpansionResult SimulationSession::expandSubcircuit(const std::string&
     children.insert(children.end(), childSubcircuitIds.begin(), childSubcircuitIds.end());
 
     expansionStack.pop_back();
-    return SubcircuitExpansionResult{subcircuitInstanceId, std::move(exposedPins)};
+    return SubcircuitExpansionResult{subcircuitInstanceId, std::move(exposedPins), primaryMcuInstanceId};
 }
 
 void SimulationSession::removeSubcircuitInstance(uint32_t subcircuitInstanceId) {
@@ -326,6 +329,23 @@ std::optional<double> SimulationSession::componentCurrent(uint32_t componentInde
     IComponentModel* instance = m_componentInstances[componentIndex].get();
     if (!instance) return std::nullopt;
     return instance->current();
+}
+
+void SimulationSession::loadMcuFirmware(uint32_t componentIndex, const std::filesystem::path& firmwarePath,
+                                        const std::string& arenaName, const std::string& qemuBinaryOverride) {
+    IComponentModel* instance = m_componentInstances.at(componentIndex).get();
+    if (!instance) throw std::runtime_error("loadMcuFirmware: componente removido");
+    auto* mcu = dynamic_cast<mcu::McuComponent*>(instance);
+    if (!mcu) throw std::runtime_error("loadMcuFirmware: componente nao e MCU/QEMU");
+    mcu->loadFirmware(firmwarePath, arenaName, qemuBinaryOverride);
+}
+
+std::string SimulationSession::mcuLogs(uint32_t componentIndex) const {
+    IComponentModel* instance = m_componentInstances.at(componentIndex).get();
+    if (!instance) throw std::runtime_error("getMcuLogs: componente removido");
+    const auto* mcu = dynamic_cast<const mcu::McuComponent*>(instance);
+    if (!mcu) throw std::runtime_error("getMcuLogs: componente nao e MCU/QEMU");
+    return mcu->qemuLogs();
 }
 
 void SimulationSession::sendComponentEvent(uint32_t componentIndex, const ComponentEvent& event) {

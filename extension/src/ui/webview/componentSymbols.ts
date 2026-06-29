@@ -330,7 +330,12 @@ const DEFAULT_BOX: ComponentBox = { width: 70, height: 40 };
 function propertyDrivenBox(typeId: string, properties: Record<string, unknown> | undefined): ComponentBox | undefined {
   if (!properties) return undefined;
   const numberOf = (key: string): number | undefined => (typeof properties[key] === "number" ? (properties[key] as number) : undefined);
+  const tunnelName = typeof properties.name === "string" ? properties.name.trim() : "";
   switch (typeId) {
+    case "connectors.tunnel": {
+      const estimatedTextWidth = tunnelName ? tunnelName.length * 7.4 + 18 : 0;
+      return { width: Math.max(100, Math.ceil(estimatedTextWidth + 58)), height: 44 };
+    }
     case "graphics.rectangle":
     case "graphics.ellipse":
     case "other.package": {
@@ -687,11 +692,17 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
 
     case "connectors.tunnel":
       {
+        const tunnelName = typeof properties?.name === "string" ? properties.name.trim() : "";
         const tipX = box.width - 20;
+        const bodyLeft = 6;
+        const bodyRight = tipX - 22;
         return (
-          `<path d="M 6 8 H ${tipX - 22} L ${tipX} ${yMid} L ${tipX - 22} ${box.height - 8} H 6 Z" ` +
+          `<path d="M ${bodyLeft} 8 H ${bodyRight} L ${tipX} ${yMid} L ${bodyRight} ${box.height - 8} H ${bodyLeft} Z" ` +
           `fill="#d7d7ec" stroke="currentColor" stroke-width="6" stroke-linejoin="round"/>` +
-          `<rect x="${tipX}" y="${yMid - 6}" width="18" height="12" rx="6" fill="currentColor"/>`
+          `<rect x="${tipX}" y="${yMid - 6}" width="18" height="12" rx="6" fill="currentColor"/>` +
+          (tunnelName
+            ? `<text x="${(bodyLeft + bodyRight) / 2}" y="${yMid + 4}" text-anchor="middle" class="tunnel-name">${escapeXmlText(tunnelName)}</text>`
+            : "")
         );
       }
 

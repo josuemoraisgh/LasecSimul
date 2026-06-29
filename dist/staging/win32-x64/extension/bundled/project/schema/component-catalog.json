@@ -1469,7 +1469,8 @@
         "Medidores"
       ],
       "defaultProperties": {
-        "threshold": 2.5
+        "thresholdRising": 2.5,
+        "thresholdFalling": 2.5
       }
     },
     {

@@ -1,6 +1,7 @@
 import { WEBVIEW_MESSAGE_VERSION, ComponentReadoutValue, HostToWebviewMessage, SimulationStatus, SymbolAuthoringKind, WebviewToHostMessage } from "./messages.js";
 import { PropertySchemaEntry, WebviewComponentModel, WebviewProjectState, WebviewWireModel } from "./model.js";
 import { PIN_RADIUS, componentBox, componentSymbolSvg, hasRealPinPosition, packageSymbolSvg, pinLocalPosition, registerPackage } from "./componentSymbols.js";
+import { detectChannelTrigger, findTriggerAnchorIndex, triggerAlignedWindowEndNs, visibleSampleWindowByTime } from "./instrumentTrigger.js";
 import {
   Point,
   WIRE_GRID_SIZE,
@@ -113,6 +114,13 @@ const UI_TEXT = {
     type: "Type",
     uid: "Uid",
     editSymbol: "Editar Símbolo Visual",
+    openSubcircuit: "Abrir Subcircuito",
+    loadFirmware: "Carregar firmware",
+    reloadFirmware: "Recarregar firmware",
+    openSerialMonitor: "Abrir monitor serial",
+    firmwareGroup: "Firmware",
+    firmwarePath: "Firmware (.bin/.elf)",
+    qemuBinary: "Binario QEMU",
   },
   en: {
     nothingSelected: "Nothing selected",
@@ -156,6 +164,13 @@ const UI_TEXT = {
     type: "Type",
     uid: "Uid",
     editSymbol: "Edit Visual Symbol",
+    openSubcircuit: "Open Subcircuit",
+    loadFirmware: "Load firmware",
+    reloadFirmware: "Reload firmware",
+    openSerialMonitor: "Open serial monitor",
+    firmwareGroup: "Firmware",
+    firmwarePath: "Firmware (.bin/.elf)",
+    qemuBinary: "QEMU binary",
   },
 } as const;
 
@@ -1864,12 +1879,22 @@ function updateReadoutHistories(readouts: Record<string, ComponentReadoutValue>)
 // `logicHistoryByComponentId`, ver `updateReadoutHistories`) -- só desenha maior, com controles.
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
+/** `timePosMs` é POR CANAL (igual a `Oscope::m_timePos[4]` real) -- cada traço pode ser deslocado
+ * horizontalmente de forma independente, além do deslocamento compartilhado vindo do trigger. */
 interface ScopeChannelSettings {
-  mode: "auto" | "trigger" | "hide";
+  hidden: boolean;
   voltDiv: number;
   voltPos: number;
+  timePosMs: number;
 }
 
+/** `triggerSource` é UMA fonte compartilhada por TODOS os canais (igual a `Oscope::m_trigger`,
+ * `int 0..3` ou nenhum) -- um osciloscópio real tem UM circuito de disparo, não um por canal;
+ * `autoScaleChannel` é o canal-alvo de auto-escala contínua (`Oscope::m_auto`, ver
+ * `OscopeChannel::updateStep()`) -- enquanto ativo, Divisão de Tempo/Tensão/Posição daquele canal
+ * seguem o período/amplitude detectados automaticamente a cada atualização, como o botão "Auto" de
+ * um osciloscópio de bancada. `filterThreshold` é a histerese de detecção de borda (mesmo papel de
+ * `OscWidget::filterBox`) -- evita disparo falso por ruído de baixa amplitude. */
 interface ScopePopupState {
   kind: "oscope";
   componentId: string;
@@ -1877,10 +1902,11 @@ interface ScopePopupState {
   y: number;
   activeTab: 0 | 1 | 2 | 3 | "all";
   timeDivMs: number;
-  timePosMs: number;
   tracks: 1 | 2 | 4;
   channels: ScopeChannelSettings[];
-  triggerLevel: number;
+  triggerSource: 0 | 1 | 2 | 3 | "none";
+  autoScaleChannel: 0 | 1 | 2 | 3 | "none";
+  filterThreshold: number;
 }
 
 interface LogicPopupState {
@@ -1913,25 +1939,30 @@ function defaultScopePopupState(componentId: string, x: number, y: number): Scop
     y,
     activeTab: "all",
     timeDivMs: 1000,
-    timePosMs: 0,
     tracks: 4,
-    channels: [0, 1, 2, 3].map(() => ({ mode: "auto", voltDiv: 1, voltPos: 0 })),
-    triggerLevel: 0,
+    channels: [0, 1, 2, 3].map(() => ({ hidden: false, voltDiv: 1, voltPos: 0, timePosMs: 0 })),
+    triggerSource: "none",
+    autoScaleChannel: "none",
+    filterThreshold: 0.05,
   };
 }
 
-function defaultLogicPopupState(componentId: string, x: number, y: number): LogicPopupState {
+/** `thresholdUp`/`thresholdDown` espelham as propriedades REAIS do componente no Core
+ * (`thresholdRising`/`thresholdFalling`, ver `LogicAnalyzer.hpp`) -- lidas do componente ao abrir
+ * (não um padrão fixo do popup) e gravadas de volta via `requestUpdateProperty` quando editadas
+ * aqui (ver `buildLogicPopup`), pra editar a histerese de verdade, não só um valor decorativo. */
+function defaultLogicPopupState(component: WebviewComponentModel, x: number, y: number): LogicPopupState {
   return {
     kind: "logic",
-    componentId,
+    componentId: component.id,
     x,
     y,
     timeDivMs: 1000,
     timePosMs: 0,
     hiddenChannels: Array.from({ length: 8 }, () => false),
     triggerChannel: "none",
-    thresholdUp: 2.5,
-    thresholdDown: 2.5,
+    thresholdUp: Number(component.properties.thresholdRising ?? 2.5),
+    thresholdDown: Number(component.properties.thresholdFalling ?? 2.5),
   };
 }
 
@@ -1949,7 +1980,7 @@ function toggleInstrumentPopup(component: WebviewComponentModel): void {
     if (component.typeId === "meters.oscope") {
       instrumentPopups.set(component.id, defaultScopePopupState(component.id, 90 + cascadeOffset, 90 + cascadeOffset));
     } else if (component.typeId === "meters.logic_analyzer") {
-      instrumentPopups.set(component.id, defaultLogicPopupState(component.id, 90 + cascadeOffset, 90 + cascadeOffset));
+      instrumentPopups.set(component.id, defaultLogicPopupState(component, 90 + cascadeOffset, 90 + cascadeOffset));
     }
     requestInstrumentHistoryRefresh(component.id);
   }
@@ -1959,45 +1990,6 @@ function toggleInstrumentPopup(component: WebviewComponentModel): void {
 function closeInstrumentPopup(componentId: string): void {
   instrumentPopups.delete(componentId);
   renderInstrumentPopups();
-}
-
-/** Acha o índice (na história COMPLETA) da transição mais recente cruzando o threshold "up" --
- * "trigger" de verdade seria por borda configurável por canal; aqui simplificado pra borda de
- * subida (mesmo papel do trigger de um osciloscópio real: UM trigger decide o alinhamento de TODOS
- * os traços exibidos, não um por canal). `undefined` se não há nenhuma transição na história
- * disponível ainda (cai pro alinhamento "auto", ancorado no fim do buffer). */
-function findTriggerAnchorIndex(history: number[], thresholdUp: number): number | undefined {
-  for (let i = history.length - 1; i > 0; i--) {
-    const previous = history[i - 1];
-    const current = history[i];
-    if (previous !== undefined && current !== undefined && previous < thresholdUp && current >= thresholdUp) return i;
-  }
-  return undefined;
-}
-
-/** Janela de amostras visível no plot, a partir de Divisão/Posição de Tempo (ambos em "ms") e dos
- * timestamps REAIS (tempo simulado, ns) de cada amostra -- nunca assume espaçamento uniforme (a
- * frequência de gravação no Core é por TEMPO decorrido, não por contagem de amostra, ver doc de
- * `Oscope.hpp`). `anchorIndex` (índice absoluto na história completa) centraliza a janela ali em
- * vez de ancorar no fim -- usado pelo modo "trigger". */
-function visibleSampleWindow(timestampsNs: number[], timeDivMs: number, timePosMs: number, anchorIndex?: number, divisions = 10): { start: number; end: number } {
-  if (timestampsNs.length === 0) return { start: 0, end: -1 };
-  const windowNs = timeDivMs * 1e6 * divisions;
-  const posNs = timePosMs * 1e6;
-  if (anchorIndex !== undefined) {
-    const centerNs = timestampsNs[anchorIndex]! + posNs;
-    let start = anchorIndex;
-    while (start > 0 && timestampsNs[start - 1]! >= centerNs - windowNs / 2) start--;
-    let end = anchorIndex;
-    while (end < timestampsNs.length - 1 && timestampsNs[end + 1]! <= centerNs + windowNs / 2) end++;
-    return { start, end };
-  }
-  const lastNs = timestampsNs[timestampsNs.length - 1]! - posNs;
-  let end = timestampsNs.length - 1;
-  while (end > 0 && timestampsNs[end]! > lastNs) end--;
-  let start = end;
-  while (start > 0 && timestampsNs[start - 1]! >= lastNs - windowNs) start--;
-  return { start, end };
 }
 
 /** Adapta o histórico de um componente pro formato unificado `{timestampsNs, values}` por canal --
@@ -2038,6 +2030,12 @@ function instrumentPlotGridSvg(plotW: number, plotH: number, divisions = 10, row
   return cols + rowLines;
 }
 
+/** Porta fiel de `Oscope::updateStep()`+`setTrigger()`/`setAutoSC()` -- UMA fonte de trigger
+ * compartilhada alinha TODOS os canais visíveis ao mesmo instante (mais o deslocamento próprio de
+ * cada canal, `timePosMs`); o canal de auto-escala (se algum) tem Divisão de Tempo/Tensão/Posição
+ * recalculados a cada atualização a partir do período/amplitude detectados -- mutação deliberada
+ * de `popup` durante o render, mesma semântica de "os botões/diais se movem sozinhos" do osciloscópio
+ * de bancada real enquanto "Auto" está ativo. */
 function renderScopePopupPlot(popup: ScopePopupState, channels: Array<{ timestampsNs: number[]; values: number[] }>): SVGSVGElement {
   const plotW = 560;
   const plotH = 280;
@@ -2046,13 +2044,32 @@ function renderScopePopupPlot(popup: ScopePopupState, channels: Array<{ timestam
   svg.classList.add("instrument-plot-svg");
   let markup = `<rect x="0" y="0" width="${plotW}" height="${plotH}" fill="#050505"/>` + instrumentPlotGridSvg(plotW, plotH);
 
+  if (popup.autoScaleChannel !== "none") {
+    const autoChannel = channels[popup.autoScaleChannel];
+    const autoSettings = popup.channels[popup.autoScaleChannel];
+    if (autoChannel && autoSettings) {
+      const autoTrigger = detectChannelTrigger(autoChannel.timestampsNs, autoChannel.values, popup.filterThreshold);
+      if (autoTrigger.periodNs !== undefined && autoTrigger.periodNs > 0) {
+        popup.timeDivMs = autoTrigger.periodNs / 5 / 1e6;
+        autoSettings.voltDiv = Math.max(0.001, autoTrigger.amplitude / 8);
+        autoSettings.voltPos = -autoTrigger.mid;
+      }
+    }
+  }
+
+  const timeFrameNs = Math.max(1, popup.timeDivMs) * 1e6 * 10;
+  const latestSampleNs = Math.max(0, ...channels.map((c) => c.timestampsNs[c.timestampsNs.length - 1] ?? 0));
+  const triggerChannelHistory = popup.triggerSource !== "none" ? channels[popup.triggerSource] : undefined;
+  const trigger = triggerChannelHistory ? detectChannelTrigger(triggerChannelHistory.timestampsNs, triggerChannelHistory.values, popup.filterThreshold) : undefined;
+  const sharedWindowEndNs = trigger ? triggerAlignedWindowEndNs(latestSampleNs, trigger, timeFrameNs) : latestSampleNs;
+
   const channelIndices = popup.activeTab === "all" ? [0, 1, 2, 3] : [popup.activeTab];
   for (const channel of channelIndices) {
     const settings = popup.channels[channel];
-    if (!settings || settings.mode === "hide") continue;
+    if (!settings || settings.hidden) continue;
     const fullHistory = channels[channel] ?? { timestampsNs: [], values: [] };
-    const anchor = settings.mode === "trigger" ? findTriggerAnchorIndex(fullHistory.values, popup.triggerLevel) : undefined;
-    const { start, end } = visibleSampleWindow(fullHistory.timestampsNs, popup.timeDivMs, popup.timePosMs, anchor);
+    const windowEndNs = sharedWindowEndNs + settings.timePosMs * 1e6;
+    const { start, end } = visibleSampleWindowByTime(fullHistory.timestampsNs, windowEndNs, timeFrameNs);
     const samples = fullHistory.values.slice(start, end + 1);
     const voltsPerPx = (settings.voltDiv * 8) / plotH; // 8 divisões verticais
     const valueToY = (value: number) => plotH / 2 - (value + settings.voltPos) / voltsPerPx;
@@ -2062,6 +2079,11 @@ function renderScopePopupPlot(popup: ScopePopupState, channels: Array<{ timestam
   return svg;
 }
 
+/** Trigger do analisador lógico é mais simples que o do osciloscópio (sinal já digitalizado, nível
+ * conhecido -- 0/1 -- não precisa de auto-detecção de amplitude): `Oscope` faz `simTime =
+ * risEdge-delta` (encaixe de período); `LAnalizer::updateStep()` faz `simTime = risEdge`
+ * DIRETAMENTE -- a borda de disparo cai exatamente na borda direita da tela, sem encaixe de
+ * período (mesma fidelidade, função mais simples porque o sinal de origem é mais simples). */
 function renderLogicPopupPlot(popup: LogicPopupState, history: { timestampsNs: number[]; masks: number[] }): SVGSVGElement {
   const plotW = 700;
   const plotH = 320;
@@ -2072,10 +2094,16 @@ function renderLogicPopupPlot(popup: LogicPopupState, history: { timestampsNs: n
 
   const visibleChannels = INSTRUMENT_CHANNEL_COLORS.map((_, ch) => ch).filter((ch) => !popup.hiddenChannels[ch]);
   const rowH = plotH / Math.max(1, visibleChannels.length);
-  const anchor = popup.triggerChannel !== "none"
-    ? findTriggerAnchorIndex(history.masks.map((mask) => ((mask >>> (popup.triggerChannel as number)) & 1)), 1)
-    : undefined;
-  const { start, end } = visibleSampleWindow(history.timestampsNs, popup.timeDivMs, popup.timePosMs, anchor);
+  const timeFrameNs = Math.max(1, popup.timeDivMs) * 1e6 * 10;
+  const latestSampleNs = history.timestampsNs[history.timestampsNs.length - 1] ?? 0;
+  let windowEndNs = latestSampleNs;
+  if (popup.triggerChannel !== "none") {
+    const bits = history.masks.map((mask) => (mask >>> (popup.triggerChannel as number)) & 1);
+    const edgeIndex = findTriggerAnchorIndex(bits, 1);
+    if (edgeIndex !== undefined) windowEndNs = history.timestampsNs[edgeIndex]!;
+  }
+  windowEndNs += popup.timePosMs * 1e6;
+  const { start, end } = visibleSampleWindowByTime(history.timestampsNs, windowEndNs, timeFrameNs);
   const samples = history.masks.slice(start, end + 1);
 
   visibleChannels.forEach((channel, row) => {
@@ -2201,11 +2229,11 @@ function buildScopePopup(popup: ScopePopupState, component: WebviewComponentMode
 
   const knobs = document.createElement("div");
   knobs.className = "instrument-knobs";
-  knobs.appendChild(makeFieldRow("Divisão de Tempo (ms)", makeNumberInput(popup.timeDivMs, 100, (v) => { popup.timeDivMs = Math.max(10, v); renderInstrumentPopups(); })));
-  knobs.appendChild(makeFieldRow("Posição de Tempo (ms)", makeNumberInput(popup.timePosMs, 100, (v) => { popup.timePosMs = v; renderInstrumentPopups(); })));
+  knobs.appendChild(makeFieldRow("Divisão de Tempo (ms)", makeNumberInput(popup.timeDivMs, 100, (v) => { popup.timeDivMs = Math.max(0.001, v); renderInstrumentPopups(); })));
   const activeChannelIndex = popup.activeTab === "all" ? 0 : popup.activeTab;
   const activeChannel = popup.channels[activeChannelIndex] ?? popup.channels[0]!;
-  knobs.appendChild(makeFieldRow("Divisão de Tensão (V)", makeNumberInput(activeChannel.voltDiv, 0.1, (v) => { activeChannel.voltDiv = Math.max(0.01, v); renderInstrumentPopups(); })));
+  knobs.appendChild(makeFieldRow("Posição de Tempo (ms)", makeNumberInput(activeChannel.timePosMs, 100, (v) => { activeChannel.timePosMs = v; renderInstrumentPopups(); })));
+  knobs.appendChild(makeFieldRow("Divisão de Tensão (V)", makeNumberInput(activeChannel.voltDiv, 0.1, (v) => { activeChannel.voltDiv = Math.max(0.001, v); renderInstrumentPopups(); })));
   knobs.appendChild(makeFieldRow("Posição de Tensão (V)", makeNumberInput(activeChannel.voltPos, 0.1, (v) => { activeChannel.voltPos = v; renderInstrumentPopups(); })));
   controls.appendChild(knobs);
 
@@ -2218,22 +2246,54 @@ function buildScopePopup(popup: ScopePopupState, component: WebviewComponentMode
     swatch.className = "instrument-channel-swatch";
     swatch.style.background = INSTRUMENT_CHANNEL_COLORS[channel] ?? "#888";
     row.appendChild(swatch);
-    (["auto", "trigger", "hide"] as const).forEach((mode) => {
-      const radioLabel = document.createElement("label");
-      const radio = document.createElement("input");
-      radio.type = "radio";
-      radio.name = `scope-${component.id}-ch${channel}`;
-      radio.checked = settings.mode === mode;
-      radio.addEventListener("change", () => {
-        settings.mode = mode;
-        renderInstrumentPopups();
-      });
-      radioLabel.append(radio, document.createTextNode(mode === "auto" ? "Auto" : mode === "trigger" ? "Trigger" : "Esconder"));
-      row.appendChild(radioLabel);
-    });
+
+    const hideLabel = document.createElement("label");
+    const hideCheck = document.createElement("input");
+    hideCheck.type = "checkbox";
+    hideCheck.checked = settings.hidden;
+    hideCheck.addEventListener("change", () => { settings.hidden = hideCheck.checked; renderInstrumentPopups(); });
+    hideLabel.append(hideCheck, document.createTextNode("Esconder"));
+    row.appendChild(hideLabel);
+
+    const triggerLabel = document.createElement("label");
+    const triggerRadio = document.createElement("input");
+    triggerRadio.type = "radio";
+    triggerRadio.name = `scope-${component.id}-trigger`;
+    triggerRadio.checked = popup.triggerSource === channel;
+    triggerRadio.addEventListener("change", () => { popup.triggerSource = channel as 0 | 1 | 2 | 3; renderInstrumentPopups(); });
+    triggerLabel.append(triggerRadio, document.createTextNode("Trigger"));
+    row.appendChild(triggerLabel);
+
+    const autoLabel = document.createElement("label");
+    const autoRadio = document.createElement("input");
+    autoRadio.type = "radio";
+    autoRadio.name = `scope-${component.id}-auto`;
+    autoRadio.checked = popup.autoScaleChannel === channel;
+    autoRadio.addEventListener("change", () => { popup.autoScaleChannel = channel as 0 | 1 | 2 | 3; renderInstrumentPopups(); });
+    autoLabel.append(autoRadio, document.createTextNode("Auto"));
+    row.appendChild(autoLabel);
+
     channelRows.appendChild(row);
   });
   controls.appendChild(channelRows);
+
+  const noTriggerLabel = document.createElement("label");
+  const noTriggerRadio = document.createElement("input");
+  noTriggerRadio.type = "radio";
+  noTriggerRadio.name = `scope-${component.id}-trigger`;
+  noTriggerRadio.checked = popup.triggerSource === "none";
+  noTriggerRadio.addEventListener("change", () => { popup.triggerSource = "none"; renderInstrumentPopups(); });
+  noTriggerLabel.append(noTriggerRadio, document.createTextNode("Trigger: Nenhum (free-running)"));
+  controls.appendChild(makeFieldRow("", noTriggerLabel));
+
+  const noAutoLabel = document.createElement("label");
+  const noAutoRadio = document.createElement("input");
+  noAutoRadio.type = "radio";
+  noAutoRadio.name = `scope-${component.id}-auto`;
+  noAutoRadio.checked = popup.autoScaleChannel === "none";
+  noAutoRadio.addEventListener("change", () => { popup.autoScaleChannel = "none"; renderInstrumentPopups(); });
+  noAutoLabel.append(noAutoRadio, document.createTextNode("Auto-escala: Nenhuma"));
+  controls.appendChild(makeFieldRow("", noAutoLabel));
 
   const tracksRow = document.createElement("div");
   tracksRow.className = "instrument-field";
@@ -2255,7 +2315,7 @@ function buildScopePopup(popup: ScopePopupState, component: WebviewComponentMode
   });
   controls.appendChild(tracksRow);
 
-  controls.appendChild(makeFieldRow("Nível de Trigger (V)", makeNumberInput(popup.triggerLevel, 0.1, (v) => { popup.triggerLevel = v; renderInstrumentPopups(); })));
+  controls.appendChild(makeFieldRow("Filtro / Histerese (V)", makeNumberInput(popup.filterThreshold, 0.01, (v) => { popup.filterThreshold = Math.max(0, v); renderInstrumentPopups(); })));
 
   body.append(plotWrap, controls);
   return container;
@@ -2326,8 +2386,16 @@ function buildLogicPopup(popup: LogicPopupState, component: WebviewComponentMode
   triggerRow.append(triggerLabel, triggerSelect);
   controls.appendChild(triggerRow);
 
-  controls.appendChild(makeFieldRow("Limiar ↑ (V)", makeNumberInput(popup.thresholdUp, 0.1, (v) => { popup.thresholdUp = v; renderInstrumentPopups(); })));
-  controls.appendChild(makeFieldRow("Limiar ↓ (V)", makeNumberInput(popup.thresholdDown, 0.1, (v) => { popup.thresholdDown = v; renderInstrumentPopups(); })));
+  controls.appendChild(makeFieldRow("Limiar ↑ (V)", makeNumberInput(popup.thresholdUp, 0.1, (v) => {
+    popup.thresholdUp = v;
+    send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateProperty", componentId: component.id, name: "thresholdRising", value: v });
+    renderInstrumentPopups();
+  })));
+  controls.appendChild(makeFieldRow("Limiar ↓ (V)", makeNumberInput(popup.thresholdDown, 0.1, (v) => {
+    popup.thresholdDown = v;
+    send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateProperty", componentId: component.id, name: "thresholdFalling", value: v });
+    renderInstrumentPopups();
+  })));
 
   const exportButton = document.createElement("button");
   exportButton.type = "button";
@@ -2480,6 +2548,12 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
   }
   const symbolProperties = runtimeSymbolProperties(component);
   svg.innerHTML = packageSymbolSvg(component.typeId, symbolProperties) ?? catalogEntry?.symbolSvg ?? componentSymbolSvg(component.typeId, symbolProperties);
+  const tunnelLabel = svg.querySelector<SVGTextElement>(".tunnel-name");
+  if (tunnelLabel && (component.flipH || component.flipV)) {
+    tunnelLabel.style.transformBox = "fill-box";
+    tunnelLabel.style.transformOrigin = "center";
+    tunnelLabel.style.transform = `scale(${component.flipH ? -1 : 1}, ${component.flipV ? -1 : 1})`;
+  }
 
   if (isComponentSelected(component.id)) {
     const overlay = document.createElementNS(SVG_NS, "rect");
@@ -2543,7 +2617,10 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
 
   el.appendChild(svg);
 
-  if (!component.hidden && component.showId) {
+  const embedsOwnIdLabel = component.typeId === "connectors.tunnel" &&
+    typeof component.properties.name === "string" &&
+    component.properties.name.trim().length > 0;
+  if (!component.hidden && component.showId && !embedsOwnIdLabel) {
     const idLabelEl = document.createElement("div");
     idLabelEl.className = "component__id-label";
     idLabelEl.textContent = component.label;
@@ -2662,7 +2739,20 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
       ? []
       : [{ label: t("properties"), icon: "properties", onClick: () => openPropertyDialog(component) }];
     const symbolMenuItems: ContextMenuItem[] = !isGroup && sourceId
-      ? [{ label: t("editSymbol"), onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestEditSymbol", sourceId }) }]
+      ? [{
+          label: catalogEntry?.registeredSourceKind === "subcircuit-file" ? t("openSubcircuit") : t("editSymbol"),
+          onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestEditSymbol", sourceId }),
+        }]
+      : [];
+    const mcuMenuItems: ContextMenuItem[] = !isGroup && isMcuHostComponent(component)
+      ? [
+          { kind: "separator" },
+          { label: t("loadFirmware"), onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestChooseMcuFirmware", componentId: component.id }) },
+          { label: t("reloadFirmware"), onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestReloadMcuFirmware", componentId: component.id }) },
+          { label: `${t("openSerialMonitor")} USART1`, onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestOpenMcuSerialMonitor", componentId: component.id, usartIndex: 0 }) },
+          { label: `${t("openSerialMonitor")} USART2`, onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestOpenMcuSerialMonitor", componentId: component.id, usartIndex: 1 }) },
+          { label: `${t("openSerialMonitor")} USART3`, onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestOpenMcuSerialMonitor", componentId: component.id, usartIndex: 2 }) },
+        ]
       : [];
     const menuItems: ContextMenuItem[] = [
       { label: t("copy"), icon: "copy", shortcut: "Ctrl+C", onClick: () => copySelectedItems() },
@@ -2676,6 +2766,7 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
       { label: t("flipHorizontal"), icon: "flipHorizontal", shortcut: "Ctrl+L", onClick: () => flipSelectedComponents("horizontal") },
       { label: t("flipVertical"), icon: "flipVertical", shortcut: "Ctrl+Shift+L", onClick: () => flipSelectedComponents("vertical") },
       ...symbolMenuItems,
+      ...mcuMenuItems,
     ];
     showContextMenu(event, menuItems);
   });
@@ -2804,6 +2895,36 @@ function valueLabelText(component: WebviewComponentModel): string | undefined {
   return typeof raw === "number" ? formatEngineeringValue(raw, schema.unit) : String(raw);
 }
 
+function isMcuHostComponent(component: WebviewComponentModel): boolean {
+  const entry = state.catalog.find((catalogEntry) => catalogEntry.typeId === component.typeId);
+  return entry?.mcuHost === true || component.typeId === "espressif.esp32";
+}
+
+function augmentRuntimePropertyFields(component: WebviewComponentModel, fields: PropertyField[]): PropertyField[] {
+  if (!isMcuHostComponent(component)) return fields;
+  const existingKeys = new Set(fields.map((field) => field.key));
+  const augmented = [...fields];
+  if (!existingKeys.has("firmwarePath")) {
+    augmented.push({
+      key: "firmwarePath",
+      label: t("firmwarePath"),
+      kind: "text",
+      value: component.properties.firmwarePath ?? "",
+      group: t("firmwareGroup"),
+    });
+  }
+  if (!existingKeys.has("qemuBinaryOverride")) {
+    augmented.push({
+      key: "qemuBinaryOverride",
+      label: t("qemuBinary"),
+      kind: "text",
+      value: component.properties.qemuBinaryOverride ?? "",
+      group: t("firmwareGroup"),
+    });
+  }
+  return augmented;
+}
+
 /** Schema-driven: grupo/ordem/rótulo/editor/min/max/opções vêm do `propertySchema` que o Core
  * declarou pro typeId (built-in ou plugin, ver `getPropertySchemas`) em vez de inferidos do valor JS
  * (`typeof value`) e de heurística de nome -- isso é o que faz spinbox, select/enum, campo oculto e
@@ -2813,7 +2934,7 @@ function valueLabelText(component: WebviewComponentModel): string | undefined {
 function resolvePropertyFields(component: WebviewComponentModel): PropertyField[] {
   const catalogEntry = state.catalog.find((entry) => entry.typeId === component.typeId);
   const schema = catalogEntry?.propertySchema;
-  if (!schema || schema.length === 0) return inferPropertyFields(component);
+  if (!schema || schema.length === 0) return augmentRuntimePropertyFields(component, inferPropertyFields(component));
 
   const fields: PropertyField[] = [];
   for (const propSchema of schema) {
@@ -2836,7 +2957,7 @@ function resolvePropertyFields(component: WebviewComponentModel): PropertyField[
       options: propSchema.options,
     });
   }
-  return fields;
+  return augmentRuntimePropertyFields(component, fields);
 }
 
 function inferPropertyFields(component: WebviewComponentModel): PropertyField[] {
@@ -2862,7 +2983,7 @@ function inferPropertyFields(component: WebviewComponentModel): PropertyField[] 
     });
   }
 
-  return fields;
+  return augmentRuntimePropertyFields(component, fields);
 }
 
 function groupFields(fields: PropertyField[]): Map<string, PropertyField[]> {

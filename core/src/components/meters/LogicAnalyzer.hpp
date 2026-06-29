@@ -9,26 +9,31 @@
 namespace lasecsimul::components {
 
 /**
- * Porta de `SimulIDE-dev/src/components/meters/logicanalizer.cpp` — analisador lógico de 8 canais
- * (`m_pin.resize(8)` no original), alta impedância, cada canal amostrado como nível digital
- * (`>` `threshold` = alto), empacotado num bitmask de 8 bits.
+ * Porta de `SimulIDE-dev/src/components/meters/logicanalizer.cpp`/`lachannel.cpp` — analisador
+ * lógico de 8 canais (`m_pin.resize(8)` no original), alta impedância, cada canal amostrado como
+ * nível digital, empacotado num bitmask de 8 bits.
+ *
+ * **Histerese de 2 limiares** (`thresholdRising`/`thresholdFalling`, porta fiel de
+ * `LAnalizer::thresholdR()`/`thresholdF()`): acima de `thresholdRising` o canal vai pra alto,
+ * abaixo de `thresholdFalling` vai pra baixo; entre os dois (zona morta) o canal MANTÉM o último
+ * nível -- mesmo princípio de um Schmitt trigger de hardware real, evita oscilação espúria do bit
+ * quando a tensão fica perto de UM limiar único (ruído cruzando repetidamente um valor fixo geraria
+ * transições falsas). Estado de histerese é POR CANAL (`m_channelHigh[8]`), já que cada canal pode
+ * estar em lados diferentes da zona morta a qualquer momento.
  *
  * **Buffer de histórico com tempo real** (2026-06-29, mesmo princípio de `Oscope`): grava um
  * bitmask por amostra, só quando passou `sampleIntervalNs` de tempo SIMULADO (`Scheduler::nowNs()`)
  * desde a última gravação -- não a cada `stamp()` (que roda por settle, não por amostra de
  * relógio). Janela "Expande" da Webview lê isso via `getComponentState()` em vez de acumular uma
  * amostra por poll de IPC (~300ms de parede, sem relação com o circuito).
- *
- * **Limitação que CONTINUA existindo**: janela de plotagem/trigger por hardware é UI da
- * Extension/Webview -- aqui só sensoriamento elétrico + histórico temporal real.
  */
 class LogicAnalyzer final : public IComponentModel {
 public:
     static constexpr size_t kChannelCount = 8;
     static constexpr size_t kHistoryCapacity = 1024;
 
-    explicit LogicAnalyzer(simulation::Scheduler& scheduler, std::array<Pin, kChannelCount> pins, double threshold)
-        : m_scheduler(scheduler), m_pins(std::move(pins)), m_threshold(threshold) {}
+    explicit LogicAnalyzer(simulation::Scheduler& scheduler, std::array<Pin, kChannelCount> pins, double thresholdRising, double thresholdFalling)
+        : m_scheduler(scheduler), m_pins(std::move(pins)), m_thresholdRising(thresholdRising), m_thresholdFalling(thresholdFalling) {}
 
     const char* typeId() const override { return "meters.logic_analyzer"; }
     std::span<Pin> pins() override { return m_pins; }
@@ -37,7 +42,10 @@ public:
         m_lastLevels = 0;
         for (size_t ch = 0; ch < kChannelCount; ++ch) {
             const double v = matrix.getNodeVoltage(m_pins[ch]);
-            if (v > m_threshold) m_lastLevels |= (1u << ch);
+            if (v > m_thresholdRising) m_channelHigh[ch] = true;
+            else if (v < m_thresholdFalling) m_channelHigh[ch] = false;
+            // zona morta entre os dois limiares: mantém m_channelHigh[ch] como estava.
+            if (m_channelHigh[ch]) m_lastLevels |= (1u << ch);
             matrix.addConductanceToGround(m_pins[ch], kInputConductance);
         }
 
@@ -82,29 +90,43 @@ public:
 
     std::vector<PropertyDescriptor> propertyDescriptors() override {
         const auto schemas = propertySchema();
-        PropertyDescriptor threshold{"threshold", "V", [this] { return PropertyValue{m_threshold}; },
-                                      [this](const PropertyValue& v) {
-                                          if (const double* d = std::get_if<double>(&v)) m_threshold = *d;
-                                      }};
-        threshold.schema = schemas[0];
+        PropertyDescriptor thresholdRising{"thresholdRising", "V", [this] { return PropertyValue{m_thresholdRising}; },
+                                            [this](const PropertyValue& v) {
+                                                if (const double* d = std::get_if<double>(&v)) m_thresholdRising = *d;
+                                            }};
+        thresholdRising.schema = schemas[0];
+        PropertyDescriptor thresholdFalling{"thresholdFalling", "V", [this] { return PropertyValue{m_thresholdFalling}; },
+                                             [this](const PropertyValue& v) {
+                                                 if (const double* d = std::get_if<double>(&v)) m_thresholdFalling = *d;
+                                             }};
+        thresholdFalling.schema = schemas[1];
         PropertyDescriptor sampleInterval{"sampleIntervalNs", "ns",
                                            [this] { return PropertyValue{static_cast<double>(m_sampleIntervalNs)}; },
                                            [this](const PropertyValue& v) {
                                                if (const double* d = std::get_if<double>(&v)) m_sampleIntervalNs = static_cast<uint64_t>(std::max(1.0, *d));
                                            }};
-        sampleInterval.schema = schemas[1];
-        return {threshold, sampleInterval};
+        sampleInterval.schema = schemas[2];
+        return {thresholdRising, thresholdFalling, sampleInterval};
     }
 
     static std::vector<PropertySchema> propertySchema() {
-        PropertySchema threshold;
-        threshold.id = "threshold";
-        threshold.label = "Limiar Lógico";
-        threshold.group = "Leitura";
-        threshold.unit = "V";
-        threshold.valueKind = PropertyValueKind::Number;
-        threshold.editor = "number";
-        threshold.defaultValue = 2.5;
+        PropertySchema thresholdRising;
+        thresholdRising.id = "thresholdRising";
+        thresholdRising.label = "Limiar Lógico ↑ (Rising)";
+        thresholdRising.group = "Leitura";
+        thresholdRising.unit = "V";
+        thresholdRising.valueKind = PropertyValueKind::Number;
+        thresholdRising.editor = "number";
+        thresholdRising.defaultValue = 2.5;
+
+        PropertySchema thresholdFalling;
+        thresholdFalling.id = "thresholdFalling";
+        thresholdFalling.label = "Limiar Lógico ↓ (Falling)";
+        thresholdFalling.group = "Leitura";
+        thresholdFalling.unit = "V";
+        thresholdFalling.valueKind = PropertyValueKind::Number;
+        thresholdFalling.editor = "number";
+        thresholdFalling.defaultValue = 2.5;
 
         PropertySchema sampleInterval;
         sampleInterval.id = "sampleIntervalNs";
@@ -116,7 +138,7 @@ public:
         sampleInterval.defaultValue = 50000.0;
         sampleInterval.minValue = 1.0;
 
-        return {threshold, sampleInterval};
+        return {thresholdRising, thresholdFalling, sampleInterval};
     }
 
 private:
@@ -134,7 +156,9 @@ private:
 
     simulation::Scheduler& m_scheduler;
     std::array<Pin, kChannelCount> m_pins;
-    double m_threshold;
+    double m_thresholdRising;
+    double m_thresholdFalling;
+    std::array<bool, kChannelCount> m_channelHigh{};
     uint32_t m_lastLevels = 0;
     std::array<Sample, kHistoryCapacity> m_history{};
     size_t m_writeIndex = 0;

@@ -1,5 +1,5 @@
 import { createTestRunner, assert } from "../../ipc/testSupport/MockCoreServer";
-import { componentBox, hasRealPinPosition, pinLocalPosition, packageSymbolSvg, registerPackage } from "./componentSymbols";
+import { componentBox, componentSymbolSvg, hasRealPinPosition, pinLocalPosition, packageSymbolSvg, registerPackage } from "./componentSymbols";
 import { PackageDescriptor } from "./model";
 
 (async () => {
@@ -123,6 +123,16 @@ import { PackageDescriptor } from "./model";
     registerPackage("test.example", pkg);
     const box = componentBox("test.example", { logicSymbol: true });
     assert(box.width === 76, "sem variante registrada, logicSymbol=true deveria ser ignorado e cair no package padrão");
+  });
+
+  await test("connectors.tunnel cresce para caber o nome e mantem o pino na ponta da seta", () => {
+    const shortBox = componentBox("connectors.tunnel", { name: "GND" });
+    const longBox = componentBox("connectors.tunnel", { name: "GPIO_UART_DEBUG_LONG_NAME" });
+    assert(longBox.width > shortBox.width, `nome longo deveria aumentar a largura (${shortBox.width} -> ${longBox.width})`);
+    const pin = pinLocalPosition("pin", 0, 1, "connectors.tunnel", { name: "GPIO_UART_DEBUG_LONG_NAME" });
+    assert(pin.x === longBox.width - 20, `pino deveria ficar na ponta da seta (x=width-20), recebido ${pin.x} para width=${longBox.width}`);
+    const svg = componentSymbolSvg("connectors.tunnel", { name: "GPIO23" });
+    assert(svg.includes("GPIO23"), "nome do tunel deveria ser desenhado dentro do simbolo");
   });
 
   registerPackage("test.example", undefined);

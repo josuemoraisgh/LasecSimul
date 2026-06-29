@@ -500,7 +500,7 @@ void registerBuiltinComponents(ComponentRegistry& reg, registry::ComponentMetada
         const auto pos = makePinVector(p, components::LogicAnalyzer::kChannelCount);
         std::array<Pin, components::LogicAnalyzer::kChannelCount> pins{};
         for (size_t i = 0; i < components::LogicAnalyzer::kChannelCount; ++i) pins[i] = pos[i];
-        return std::make_unique<components::LogicAnalyzer>(scheduler, pins, p.property("threshold", 2.5));
+        return std::make_unique<components::LogicAnalyzer>(scheduler, pins, p.property("thresholdRising", 2.5), p.property("thresholdFalling", 2.5));
     });
     registerBuiltinMetadata("meters.logic_analyzer", "Analisador Lógico", components::LogicAnalyzer::propertySchema(),
                             englishName("Logic Analyzer"));
@@ -951,7 +951,11 @@ OutgoingResponse handleMessage(const IncomingMessage& msg, SimulationSession& se
                 }
                 resp.ok = true;
                 resp.payloadJson = nlohmann::json{{"instanceId", std::to_string(expansion.subcircuitInstanceId)},
-                                                   {"exposedPins", exposedPinsJson}}
+                                                   {"exposedPins", exposedPinsJson},
+                                                   {"primaryMcuInstanceId",
+                                                    expansion.primaryMcuInstanceId
+                                                        ? nlohmann::json(std::to_string(*expansion.primaryMcuInstanceId))
+                                                        : nlohmann::json(nullptr)}}
                                         .dump();
             } else {
                 const uint32_t instanceId = session.addComponent(typeId, params);
@@ -1113,6 +1117,36 @@ OutgoingResponse handleMessage(const IncomingMessage& msg, SimulationSession& se
         } catch (const std::exception& e) {
             resp.ok = false;
             resp.error = std::string("getNodeVoltage falhou: ") + e.what();
+        }
+        return resp;
+    }
+    if (msg.type == "loadMcuFirmware") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const uint32_t instanceId = static_cast<uint32_t>(std::stoul(payload.value("instanceId", std::string{"0"})));
+            const std::string firmwarePath = payload.value("firmwarePath", std::string{});
+            const std::string qemuBinaryOverride = payload.value("qemuBinaryOverride", std::string{});
+            if (firmwarePath.empty()) throw std::runtime_error("caminho do firmware vazio");
+            const std::string arenaName = "lasecsimul-mcu-" + std::to_string(instanceId);
+            session.loadMcuFirmware(instanceId, firmwarePath, arenaName, qemuBinaryOverride);
+            resp.ok = true;
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("loadMcuFirmware falhou: ") + e.what();
+        }
+        return resp;
+    }
+    if (msg.type == "getMcuLogs") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const uint32_t instanceId = static_cast<uint32_t>(std::stoul(payload.value("instanceId", std::string{"0"})));
+            resp.ok = true;
+            resp.payloadJson = nlohmann::json{{"logs", session.mcuLogs(instanceId)}}.dump();
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("getMcuLogs falhou: ") + e.what();
         }
         return resp;
     }

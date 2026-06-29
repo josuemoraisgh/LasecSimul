@@ -420,7 +420,7 @@ void testLogicAnalyzerRecordsTimestampedHistory() {
         const auto pos = p.pins<8>();
         std::array<Pin, 8> pins{};
         for (size_t i = 0; i < 8; ++i) pins[i] = Pin{pos[i].id.empty() ? ("ch" + std::to_string(i)) : pos[i].id};
-        return std::make_unique<components::LogicAnalyzer>(session.scheduler(), pins, p.property("threshold", 2.5));
+        return std::make_unique<components::LogicAnalyzer>(session.scheduler(), pins, p.property("thresholdRising", 2.5), p.property("thresholdFalling", 2.5));
     });
     session.components().registerFactory("sources.dc_voltage", [](const ComponentParams& p) {
         return std::make_unique<components::DcVoltageSource>(std::array<Pin, 2>{Pin{"p1"}, Pin{"p2"}}, p.property("voltage", 5.0));
@@ -454,6 +454,51 @@ void testLogicAnalyzerRecordsTimestampedHistory() {
     check((firstMask & 1u) == 1u, "LogicAnalyzer: bitmask gravado no historico reflete o canal em alto");
 }
 
+/** Prova a histerese de 2 limiares (porta de `LaChannel::voltChanged()`'s `thresholdR`/
+ * `thresholdF` -- ver SimulIDE-dev real): entre os dois limiares (zona morta), o canal MANTÉM o
+ * último nível em vez de oscilar -- evita transição falsa por ruído perto de um limiar único. */
+void testLogicAnalyzerHysteresisHoldsStateInDeadZone() {
+    GlobalPluginCache cache;
+    SimulationSession session(cache);
+    registerCommon(session.components());
+    session.components().registerFactory("meters.logic_analyzer", [&session](const ComponentParams& p) {
+        const auto pos = p.pins<8>();
+        std::array<Pin, 8> pins{};
+        for (size_t i = 0; i < 8; ++i) pins[i] = Pin{pos[i].id.empty() ? ("ch" + std::to_string(i)) : pos[i].id};
+        return std::make_unique<components::LogicAnalyzer>(session.scheduler(), pins, p.property("thresholdRising", 3.0), p.property("thresholdFalling", 2.0));
+    });
+    session.components().registerFactory("sources.dc_voltage", [](const ComponentParams& p) {
+        return std::make_unique<components::DcVoltageSource>(std::array<Pin, 2>{Pin{"p1"}, Pin{"p2"}}, p.property("voltage", 0.0));
+    });
+
+    const uint32_t analyzer = session.addComponent("meters.logic_analyzer", withProp("thresholdRising", 3.0));
+    session.setProperty(analyzer, "thresholdFalling", PropertyValue{2.0});
+    const uint32_t source = session.addComponent("sources.dc_voltage", withProp("voltage", 0.0));
+    const uint32_t ground = session.addComponent("other.ground", {});
+    session.connectWire(source, "p1", analyzer, "ch0");
+    session.connectWire(source, "p2", ground, "pin");
+
+    auto readCh0 = [&]() {
+        for (int i = 0; i < 10 && session.settleStep(); ++i) {}
+        const std::vector<uint8_t> state = session.getComponentState(analyzer);
+        return (readU32(state, 0) & 1u) != 0;
+    };
+
+    check(readCh0() == false, "Histerese: 0V (abaixo dos dois limiares) comeca em baixo");
+
+    session.setProperty(source, "voltage", PropertyValue{3.5});
+    check(readCh0() == true, "Histerese: 3.5V (> limiar de subida 3.0V) vai para alto");
+
+    session.setProperty(source, "voltage", PropertyValue{2.5});
+    check(readCh0() == true, "Histerese: 2.5V (zona morta entre 2.0V e 3.0V) MANTEM alto, nao cai");
+
+    session.setProperty(source, "voltage", PropertyValue{1.5});
+    check(readCh0() == false, "Histerese: 1.5V (< limiar de queda 2.0V) vai para baixo");
+
+    session.setProperty(source, "voltage", PropertyValue{2.5});
+    check(readCh0() == false, "Histerese: 2.5V de novo (zona morta), agora vindo de baixo, MANTEM baixo");
+}
+
 } // namespace
 
 int main() {
@@ -468,6 +513,7 @@ int main() {
     testWaveGenSquareWaveOutputsExpectedVoltageAndCurrent();
     testOscopeRecordsTimestampedHistoryWithWraparound();
     testLogicAnalyzerRecordsTimestampedHistory();
+    testLogicAnalyzerHysteresisHoldsStateInDeadZone();
 
     if (failures == 0) {
         std::printf("\nTodos os testes de Fontes/Medidores SimulIDE passaram.\n");

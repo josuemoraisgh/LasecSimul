@@ -166,11 +166,20 @@ void McuComponent::stamp(MnaMatrixView& matrix) {
     scheduleWakeupsForAllModules();
 }
 
-void McuComponent::loadFirmware(const std::filesystem::path& firmwarePath, const std::string& arenaName) {
+void McuComponent::loadFirmware(const std::filesystem::path& firmwarePath, const std::string& arenaName,
+                                const std::string& qemuBinaryOverride) {
     m_lastFirmwarePath = firmwarePath;
     m_lastArenaName = arenaName;
 
+    if (m_processManager.isRunning()) stopFirmware();
+    if (m_arenaOpen) {
+        m_arenaBridge.close();
+        m_arenaOpen = false;
+    }
+    resetModulesAndWakeups();
+
     QemuLaunchSpec spec = m_adapter->buildLaunchArgs(firmwarePath.string());
+    if (!qemuBinaryOverride.empty()) spec.binary = qemuBinaryOverride;
     spec.args.insert(spec.args.begin(), arenaName); // argv[1] = chave da arena, ver McuController
 
     m_arenaBridge.open(qemu::QemuArenaOpenOptions{arenaName, true});

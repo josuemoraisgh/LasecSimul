@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import * as path from "path";
 import * as vscode from "vscode";
 import { LasecSimulLanguage } from "../../language";
 import { WebviewComponentCatalogEntry } from "../webview/model";
@@ -38,6 +39,7 @@ export class ComponentPaletteViewProvider implements vscode.WebviewViewProvider 
 
   setCatalog(catalog: WebviewComponentCatalogEntry[]): void {
     this.catalog = [...catalog];
+    this.updateWebviewOptions();
     void this.postState();
   }
 
@@ -48,16 +50,27 @@ export class ComponentPaletteViewProvider implements vscode.WebviewViewProvider 
 
   resolveWebviewView(webviewView: vscode.WebviewView): void | Thenable<void> {
     this.view = webviewView;
-    webviewView.webview.options = {
+    this.updateWebviewOptions();
+    webviewView.webview.html = this.renderHtml(webviewView.webview);
+    webviewView.webview.onDidReceiveMessage((message: PaletteWebviewMessage) => this.handleMessage(message));
+  }
+
+  private updateWebviewOptions(): void {
+    if (!this.view) return;
+    const iconRoots = new Set<string>();
+    for (const entry of this.catalog) {
+      if (!entry.iconFilePath) continue;
+      iconRoots.add(path.dirname(entry.iconFilePath));
+    }
+    this.view.webview.options = {
       enableScripts: true,
       localResourceRoots: [
         vscode.Uri.joinPath(this.extensionUri, "media", "components"),
         vscode.Uri.joinPath(this.extensionUri, "src", "ui", "palette"),
         vscode.Uri.joinPath(this.extensionUri, "out-webview"),
+        ...[...iconRoots].map((root) => vscode.Uri.file(root)),
       ],
     };
-    webviewView.webview.html = this.renderHtml(webviewView.webview);
-    webviewView.webview.onDidReceiveMessage((message: PaletteWebviewMessage) => this.handleMessage(message));
   }
 
   private handleMessage(message: PaletteWebviewMessage): void {

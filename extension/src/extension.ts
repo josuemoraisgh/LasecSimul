@@ -62,6 +62,8 @@ interface ResolvedRegisteredItem {
  * "ignora silenciosamente", nunca como erro fatal (ver docs/mvp-limitacoes.md).
  */
 const coreInstanceIdByComponentId = new Map<string, string>();
+const mcuTargetCoreIdByComponentId = new Map<string, string>();
+const mcuSerialMonitorByKey = new Map<string, { channel: vscode.OutputChannel; timer: ReturnType<typeof setInterval>; lastLength: number }>();
 
 function nextId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -249,6 +251,17 @@ interface DeviceLsconfig {
   defaultProperties?: Record<string, string | number | boolean>;
 }
 
+function manifestHostsMcu(json: Record<string, unknown>): boolean {
+  if (typeof json.chipId === "string" && json.chipId.trim()) return true;
+  if (!Array.isArray(json.components)) return false;
+  return json.components.some((component) =>
+    typeof component === "object" &&
+    component !== null &&
+    typeof (component as Record<string, unknown>).typeId === "string" &&
+    String((component as Record<string, unknown>).typeId).startsWith("espressif.")
+  );
+}
+
 function inferLsconfigPath(manifestPath: string): string | undefined {
   const direct = path.join(path.dirname(manifestPath), "device.lsconfig");
   if (fileExists(direct)) return direct;
@@ -303,6 +316,7 @@ function createDisabledEntry(
       isRegistered: true,
       registeredSourceId: source.id,
       registeredSourceRemovable: source.removable !== false,
+      registeredSourceKind: kind,
       icon: "fantasma",
     },
   };
@@ -381,6 +395,8 @@ function resolveRegisteredItem(source: RegisteredSource, extensionPath: string, 
         isRegistered: true,
         registeredSourceId: source.id,
         registeredSourceRemovable: source.removable !== false,
+        registeredSourceKind: source.kind,
+        mcuHost: source.kind === "mcu-adapter",
       };
       if (source.kind === "abi-device" && (!libraryPath || !fileExists(libraryPath))) {
         return {
@@ -458,6 +474,8 @@ function resolveRegisteredItem(source: RegisteredSource, extensionPath: string, 
       isRegistered: true,
       registeredSourceId: source.id,
       registeredSourceRemovable: source.removable !== false,
+      registeredSourceKind: source.kind,
+      mcuHost: manifestHostsMcu(json),
     };
     if (!libraryPath || !fileExists(libraryPath)) {
       return {
@@ -571,6 +589,15 @@ function reportCoreWarning(action: string, err: unknown): void {
   );
 }
 
+function registerCoreIdsForComponent(componentId: string, typeId: string, response: { instanceId: string; primaryMcuInstanceId?: string }): void {
+  coreInstanceIdByComponentId.set(componentId, response.instanceId);
+  if (typeId === "espressif.esp32") {
+    mcuTargetCoreIdByComponentId.set(componentId, response.instanceId);
+    return;
+  }
+  if (response.primaryMcuInstanceId) mcuTargetCoreIdByComponentId.set(componentId, response.primaryMcuInstanceId);
+}
+
 /** Cria a instância no Core de forma assíncrona (fire-and-forget) — usado pelo fluxo interativo da
  * Webview, onde cada ação do usuário já é, por natureza, sequencial no tempo humano. O carregamento
  * de um projeto inteiro usa `pushProjectToCore`, que aguarda cada chamada, exatamente para evitar a
@@ -584,7 +611,7 @@ function pushComponentToCore(
   if (!coreClient || !shouldSyncComponentToCore(typeId)) return;
   coreClient
     .addComponent(typeId, properties, pins)
-    .then((instanceId) => coreInstanceIdByComponentId.set(componentId, instanceId))
+    .then((response) => registerCoreIdsForComponent(componentId, typeId, response))
     .catch((err) => reportCoreWarning(`criar "${typeId}"`, err));
 }
 
@@ -596,8 +623,17 @@ function pushWireToCore(wire: WebviewWireModel): void {
   coreClient.connectWire(coreA, wire.from.pinId, coreB, wire.to.pinId).catch((err) => reportCoreWarning("conectar fio", err));
 }
 
+function isUiOnlyRuntimeProperty(component: WebviewComponentModel | undefined, name: string): boolean {
+  if (!component || (name !== "firmwarePath" && name !== "qemuBinaryOverride")) return false;
+  if (component.typeId === "espressif.esp32") return true;
+  const catalogEntry = schematicState.catalog.find((entry) => entry.typeId === component.typeId);
+  return catalogEntry?.mcuHost === true;
+}
+
 function pushPropertyToCore(componentId: string, name: string, value: string | number | boolean): void {
   if (!coreClient) return;
+  const component = schematicState.components.find((entry) => entry.id === componentId);
+  if (isUiOnlyRuntimeProperty(component, name)) return;
   const coreId = coreInstanceIdByComponentId.get(componentId);
   if (!coreId) return;
   coreClient
@@ -617,6 +653,7 @@ function pushRemoveToCore(componentId: string): void {
   const coreId = coreInstanceIdByComponentId.get(componentId);
   if (!coreId) return;
   coreClient.removeComponent(coreId).catch((err) => reportCoreWarning("remover componente", err));
+  mcuTargetCoreIdByComponentId.delete(componentId);
 }
 
 let voltageReadoutTimer: ReturnType<typeof setInterval> | undefined;
@@ -820,6 +857,136 @@ function stopSimulation(): void {
     });
 }
 
+function getComponentById(componentId: string): WebviewComponentModel | undefined {
+  return schematicState.components.find((component) => component.id === componentId);
+}
+
+function componentLabel(componentId: string): string {
+  return getComponentById(componentId)?.label ?? componentId;
+}
+
+function resolveMcuTargetCoreId(componentId: string): string | undefined {
+  return mcuTargetCoreIdByComponentId.get(componentId) ?? coreInstanceIdByComponentId.get(componentId);
+}
+
+function closeMcuSerialMonitor(componentId: string, usartIndex?: number): void {
+  for (const [key, monitor] of mcuSerialMonitorByKey) {
+    const [currentComponentId, currentUsartIndex] = key.split(":");
+    if (currentComponentId !== componentId) continue;
+    if (usartIndex !== undefined && Number(currentUsartIndex) !== usartIndex) continue;
+    clearInterval(monitor.timer);
+    monitor.channel.dispose();
+    mcuSerialMonitorByKey.delete(key);
+  }
+}
+
+function closeAllMcuSerialMonitors(): void {
+  for (const [key, monitor] of mcuSerialMonitorByKey) {
+    clearInterval(monitor.timer);
+    monitor.channel.dispose();
+    mcuSerialMonitorByKey.delete(key);
+  }
+}
+
+async function chooseMcuFirmwareCommand(componentId: string): Promise<void> {
+  const component = getComponentById(componentId);
+  if (!component) return;
+  const picked = await vscode.window.showOpenDialog({
+    canSelectMany: false,
+    filters: { Firmware: ["bin", "elf", "hex"] },
+    title: `Selecionar firmware para ${component.label}`,
+  });
+  const selected = picked?.[0];
+  if (!selected) return;
+
+  const firmwarePath = selected.fsPath;
+  const qemuBinaryOverride = typeof component.properties.qemuBinaryOverride === "string" ? component.properties.qemuBinaryOverride : "";
+  schematicState = {
+    ...schematicState,
+    components: schematicState.components.map((entry) =>
+      entry.id === componentId
+        ? { ...entry, properties: { ...entry.properties, firmwarePath } }
+        : entry
+    ),
+  };
+  syncSchematicPanel();
+
+  if (simulationStatus === "running") {
+    const targetCoreId = resolveMcuTargetCoreId(componentId);
+    if (coreClient && targetCoreId) {
+      try {
+        await coreClient.loadMcuFirmware(targetCoreId, firmwarePath, qemuBinaryOverride || undefined);
+      } catch (err) {
+        reportCoreWarning(`carregar firmware de "${component.label}"`, err);
+      }
+    }
+  }
+}
+
+async function reloadMcuFirmwareCommand(componentId: string): Promise<void> {
+  const component = getComponentById(componentId);
+  if (!component) return;
+  const firmwarePath = typeof component.properties.firmwarePath === "string" ? component.properties.firmwarePath.trim() : "";
+  const qemuBinaryOverride = typeof component.properties.qemuBinaryOverride === "string" ? component.properties.qemuBinaryOverride.trim() : "";
+  if (!firmwarePath) {
+    vscode.window.showWarningMessage(`Defina o firmware do componente "${component.label}" primeiro.`);
+    return;
+  }
+  const targetCoreId = resolveMcuTargetCoreId(componentId);
+  if (!coreClient || !targetCoreId) {
+    vscode.window.showWarningMessage(`O MCU de "${component.label}" ainda nao esta disponivel no Core.`);
+    return;
+  }
+  try {
+    await coreClient.loadMcuFirmware(targetCoreId, firmwarePath, qemuBinaryOverride || undefined);
+  } catch (err) {
+    reportCoreWarning(`recarregar firmware de "${component.label}"`, err);
+  }
+}
+
+function openMcuSerialMonitorCommand(componentId: string, usartIndex: 0 | 1 | 2): void {
+  const targetCoreId = resolveMcuTargetCoreId(componentId);
+  const component = getComponentById(componentId);
+  if (!coreClient || !targetCoreId || !component) {
+    vscode.window.showWarningMessage("Monitor serial indisponivel para este componente.");
+    return;
+  }
+  const key = `${componentId}:${usartIndex}`;
+  const existing = mcuSerialMonitorByKey.get(key);
+  if (existing) {
+    existing.channel.show(true);
+    return;
+  }
+
+  const channel = vscode.window.createOutputChannel(`LasecSimul USART${usartIndex + 1} - ${component.label}`);
+  channel.appendLine(`[${new Date().toLocaleString()}] Monitor serial aberto para ${component.label} (USART${usartIndex + 1}).`);
+  channel.appendLine("Observacao: por enquanto o monitor espelha os logs/saida do QEMU expostos pelo Core.");
+
+  const pollLogs = async (): Promise<void> => {
+    try {
+      const logs = await coreClient!.getMcuLogs(targetCoreId);
+      const monitor = mcuSerialMonitorByKey.get(key);
+      if (!monitor) return;
+      const delta = logs.slice(monitor.lastLength);
+      if (delta) {
+        channel.append(delta);
+        monitor.lastLength = logs.length;
+      } else if (logs.length < monitor.lastLength) {
+        channel.appendLine(`\n[${new Date().toLocaleTimeString()}] logs reiniciados`);
+        if (logs) channel.append(logs);
+        monitor.lastLength = logs.length;
+      }
+    } catch (err) {
+      channel.appendLine(`\n[erro] ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const timer = setInterval(() => void pollLogs(), 500);
+  mcuSerialMonitorByKey.set(key, { channel, timer, lastLength: 0 });
+  channel.show(true);
+  void pollLogs();
+}
+
 /** `pinIds` (quando presente) é o contrato elétrico REAL na ordem que o Core espera -- plugins usam
  * o id enviado aqui diretamente (`NativeDeviceProxy`/`McuComponent`, ver `CoreApplication.cpp`,
  * `addComponent`), nunca um `pin-N` genérico sem relação com nada real. Sem `pinIds` (built-ins sem
@@ -920,16 +1087,17 @@ async function rebuildCoreFromSchematicState(): Promise<void> {
     }
   }
   coreInstanceIdByComponentId.clear();
+  mcuTargetCoreIdByComponentId.clear();
 
   for (const component of schematicState.components) {
     if (!shouldSyncComponentToCore(component.typeId)) continue;
     try {
-      const instanceId = await coreClient.addComponent(
+      const response = await coreClient.addComponent(
         component.typeId,
         component.properties,
         pinsForTypeId(component.typeId)
       );
-      coreInstanceIdByComponentId.set(component.id, instanceId);
+      registerCoreIdsForComponent(component.id, component.typeId, response);
     } catch (err) {
       reportCoreWarning(`recriar "${component.typeId}" (${component.id})`, err);
     }
@@ -965,15 +1133,16 @@ async function rebuildCoreFromSchematicState(): Promise<void> {
 async function pushProjectToCore(project: ProjectDocument): Promise<void> {
   if (!coreClient) return;
   coreInstanceIdByComponentId.clear();
+  mcuTargetCoreIdByComponentId.clear();
   for (const component of project.components) {
     if (!shouldSyncComponentToCore(component.typeId)) continue;
     try {
-      const instanceId = await coreClient.addComponent(
+      const response = await coreClient.addComponent(
         component.typeId,
         component.properties,
         pinsForTypeId(component.typeId)
       );
-      coreInstanceIdByComponentId.set(component.id, instanceId);
+      registerCoreIdsForComponent(component.id, component.typeId, response);
     } catch (err) {
       reportCoreWarning(`criar "${component.typeId}" (${component.id})`, err);
     }
@@ -1124,8 +1293,10 @@ function handleWebviewMessage(message: WebviewToHostMessage): void {
       return;
     }
     case "requestRemoveComponent": {
+      closeMcuSerialMonitor(message.componentId);
       pushRemoveToCore(message.componentId);
       coreInstanceIdByComponentId.delete(message.componentId);
+      mcuTargetCoreIdByComponentId.delete(message.componentId);
       const removedWireIds = new Set(
         schematicState.wires
           .filter((wire) => wire.from.componentId === message.componentId || wire.to.componentId === message.componentId)
@@ -1306,6 +1477,15 @@ function handleWebviewMessage(message: WebviewToHostMessage): void {
     case "requestEditSymbol":
       void editPackageSymbolCommand({ sourceId: message.sourceId });
       return;
+    case "requestChooseMcuFirmware":
+      void chooseMcuFirmwareCommand(message.componentId);
+      return;
+    case "requestReloadMcuFirmware":
+      void reloadMcuFirmwareCommand(message.componentId);
+      return;
+    case "requestOpenMcuSerialMonitor":
+      openMcuSerialMonitorCommand(message.componentId, message.usartIndex);
+      return;
     case "requestSwitchSymbolView":
       void switchSymbolViewCommand(message.filePath, message.typeId, message.kind, message.toView, message.internalComponents, message.internalWires);
       return;
@@ -1360,6 +1540,7 @@ async function openProjectCommand(context: vscode.ExtensionContext): Promise<voi
   });
   const selected = uris?.[0];
   if (!selected) return;
+  closeAllMcuSerialMonitors();
   const project = await projectSerializer.load(selected.fsPath);
   schematicState = projectToWebviewState(project);
   if (!schematicPanel) openSchematicEditor(context.extensionUri);
@@ -1493,25 +1674,23 @@ async function refreshUnifiedCatalogState(loadLibrariesInCore: boolean): Promise
     : new Map<string, string>();
 
   const baseTypeIds = new Set(unifiedCatalog.catalog.map((entry) => entry.typeId));
-  const registeredEntries = resolved.map((item) => {
+  const registeredEntries = resolved.flatMap((item) => {
     const failedReason = item.libraryPathToLoad
       ? failures.get(normalizeAbsolutePath(extensionContext!.extensionPath, item.libraryPathToLoad))
       : undefined;
     if (failedReason) {
-      return {
+      return [{
         ...item.entry,
         disabled: true,
         disabledReason: localizedAbiFailure(failedReason, currentLasecSimulLanguage()),
-      };
+      }];
     }
     if (baseTypeIds.has(item.entry.typeId)) {
-      return {
-        ...item.entry,
-        disabled: true,
-        disabledReason: localizedBaseCatalogConflict(currentLasecSimulLanguage()),
-      };
+      // Catálogo base vence: evita duplicata "registrada" com lápis/ícone externo quando o mesmo
+      // typeId já existe como item nativo da paleta (caso do voltímetro).
+      return [];
     }
-    return item.entry;
+    return [item.entry];
   });
 
   const mergedCatalog = [...unifiedCatalog.catalog, ...registeredEntries];
@@ -2044,6 +2223,7 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export async function deactivate(): Promise<void> {
+  closeAllMcuSerialMonitors();
   stopVoltageReadoutPolling();
   await coreClient?.stop().catch(() => {});
   coreProc?.kill(); // force-kill de segurança caso shutdown IPC não tenha chegado

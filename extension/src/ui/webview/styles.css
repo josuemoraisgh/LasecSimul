@@ -371,6 +371,13 @@ html, body {
   fill: var(--accent-2);
 }
 
+.tunnel-name {
+  fill: #111;
+  stroke: none;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .pin-terminal {
   fill: var(--accent-2);
   stroke: var(--bg);

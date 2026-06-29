@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -28,6 +29,7 @@ struct SubcircuitExposedPin {
 struct SubcircuitExpansionResult {
     uint32_t subcircuitInstanceId;
     std::unordered_map<std::string, SubcircuitExposedPin> exposedPins;
+    std::optional<uint32_t> primaryMcuInstanceId;
 };
 
 /**
@@ -119,6 +121,9 @@ public:
      * `IComponentModel::current()`. `std::nullopt` se o componente não implementa isso ou se já
      * foi removido. Nunca dispara solve novo, mesmo princípio de `nodeVoltageOfPin`. */
     std::optional<double> componentCurrent(uint32_t componentIndex) const;
+    void loadMcuFirmware(uint32_t componentIndex, const std::filesystem::path& firmwarePath,
+                         const std::string& arenaName, const std::string& qemuBinaryOverride);
+    std::string mcuLogs(uint32_t componentIndex) const;
 
     void sendComponentEvent(uint32_t componentIndex, const ComponentEvent& event);
 
