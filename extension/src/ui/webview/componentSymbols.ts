@@ -118,6 +118,51 @@ function escapeXmlText(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+function formatRailVoltage(value: number): string {
+  if (Number.isInteger(value)) return String(value);
+  return Number(value.toFixed(2)).toString();
+}
+
+function symbolReadoutNumber(properties?: Record<string, unknown>): number | undefined {
+  return typeof properties?.__readout === "number" ? properties.__readout : undefined;
+}
+
+function symbolReadoutArray(properties?: Record<string, unknown>): number[] {
+  return Array.isArray(properties?.__readout) ? properties.__readout.map((value) => Number(value) || 0) : [];
+}
+
+function symbolHistoryArray(properties?: Record<string, unknown>): number[] {
+  return Array.isArray(properties?.__history) ? properties.__history.map((value) => Number(value) || 0) : [];
+}
+
+function symbolHistoryMatrix(properties?: Record<string, unknown>): number[][] {
+  if (!Array.isArray(properties?.__history)) return [];
+  return properties.__history.map((row) => Array.isArray(row) ? row.map((value) => Number(value) || 0) : []);
+}
+
+function formatLcdNumber(value: number | undefined): string {
+  return (value ?? 0).toFixed(3);
+}
+
+function formatHz(value: number | undefined): string {
+  const hz = value ?? 0;
+  if (hz >= 1000) return `${Number((hz / 1000).toFixed(2))} kHz`;
+  return `${Math.round(hz)} Hz`;
+}
+
+function tracePath(history: number[], x: number, y: number, width: number, height: number, min = -5, max = 5): string {
+  const samples = history.length > 1 ? history : [0, 0];
+  const span = Math.max(1e-9, max - min);
+  return samples
+    .map((value, index) => {
+      const px = x + (width * index) / Math.max(1, samples.length - 1);
+      const normalized = Math.max(0, Math.min(1, (value - min) / span));
+      const py = y + height - normalized * height;
+      return `${index === 0 ? "M" : "L"} ${px.toFixed(1)} ${py.toFixed(1)}`;
+    })
+    .join(" ");
+}
+
 function packageShapeSvg(shape: PackageShape): string {
   switch (shape.kind) {
     case "rect":
@@ -155,7 +200,7 @@ function packagePinLeadSvg(pin: PackagePin): string {
   const rotateAttr = isVerticalLead ? ` transform="rotate(-90 ${labelX.toFixed(1)} ${labelY.toFixed(1)})"` : "";
   return (
     `<line x1="${pin.x}" y1="${pin.y}" x2="${tipX.toFixed(1)}" y2="${tipY.toFixed(1)}" class="symbol-stroke"/>` +
-    `<text x="${labelX.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" class="symbol-text" style="font-size:7px"${rotateAttr}>${escapeXmlText(label)}</text>`
+    `<text x="${labelX.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" class="symbol-text" style="font-size:9px"${rotateAttr}>${escapeXmlText(label)}</text>`
   );
 }
 
@@ -167,6 +212,12 @@ function packageBodySvg(resolved: ResolvedPackage): string {
   let markup = "";
   if (pkg.background?.kind === "color" && pkg.background.value) {
     markup += `<rect x="0" y="0" width="${pkg.width}" height="${pkg.height}" fill="${pkg.background.value}"/>`;
+  } else if (pkg.background?.kind === "image" && pkg.background.data) {
+    // `data` é o PNG/JPEG em base64 puro (sem prefixo `data:`) -- mesma convenção de
+    // `BckGndData` do SimulIDE real (foto da placa real embutida no próprio arquivo, sem
+    // depender de um asset externo que possa ficar pendente). `preserveAspectRatio="none"`
+    // porque width/height do package JÁ são as dimensões nativas da imagem (1:1, sem distorção).
+    markup += `<image x="0" y="0" width="${pkg.width}" height="${pkg.height}" preserveAspectRatio="none" href="data:image/png;base64,${pkg.background.data}"/>`;
   }
   if (pkg.border) {
     markup += `<rect x="0.5" y="0.5" width="${Math.max(0, pkg.width - 1)}" height="${Math.max(0, pkg.height - 1)}" class="symbol-stroke" fill="none"/>`;
@@ -194,7 +245,7 @@ const COMPONENT_BOX: Record<string, ComponentBox> = {
   "passive.transformer": { width: 86, height: 58 },
   "other.ground": { width: 48, height: 36 },
   "connectors.bus": { width: 76, height: 28 },
-  "connectors.tunnel": { width: 36, height: 36 },
+  "connectors.tunnel": { width: 100, height: 44 },
   "connectors.socket": { width: 72, height: 86 },
   "connectors.header": { width: 76, height: 36 },
   "graphics.image": { width: 96, height: 64 },
@@ -207,8 +258,8 @@ const COMPONENT_BOX: Record<string, ComponentBox> = {
   "other.dial": { width: 56, height: 56 },
   "sources.dc_voltage": { width: 64, height: 48 },
   "logic.button": { width: 68, height: 32 },
-  "switches.push": { width: 68, height: 32 },
-  "switches.switch": { width: 68, height: 32 },
+  "switches.push": { width: 68, height: 54 },
+  "switches.switch": { width: 68, height: 54 },
   "switches.switch_dip": { width: 86, height: 120 },
   "switches.relay": { width: 86, height: 64 },
   "switches.keypad": { width: 88, height: 88 },
@@ -247,22 +298,22 @@ const COMPONENT_BOX: Record<string, ComponentBox> = {
   "outputs.servo": { width: 84, height: 54 },
   "outputs.audio_out": { width: 62, height: 48 },
   "outputs.incandescent_lamp": { width: 72, height: 52 },
-  "instruments.voltmeter": { width: 64, height: 48 },
+  "instruments.voltmeter": { width: 82, height: 56 },
 
-  "meters.probe": { width: 36, height: 28 },
-  "meters.ampmeter": { width: 64, height: 48 },
-  "meters.freqmeter": { width: 86, height: 32 },
-  "meters.oscope": { width: 70, height: 56 },
-  "meters.logic_analyzer": { width: 70, height: 64 },
+  "meters.probe": { width: 82, height: 44 },
+  "meters.ampmeter": { width: 82, height: 56 },
+  "meters.freqmeter": { width: 116, height: 34 },
+  "meters.oscope": { width: 260, height: 150 },
+  "meters.logic_analyzer": { width: 260, height: 212 },
 
-  "sources.fixed_volt": { width: 40, height: 36 },
+  "sources.fixed_volt": { width: 76, height: 54 },
   "sources.clock": { width: 44, height: 32 },
   "sources.wave_gen": { width: 56, height: 40 },
   "sources.voltage_source": { width: 64, height: 48 },
   "sources.current_source": { width: 64, height: 48 },
   "sources.controlled_source": { width: 56, height: 56 },
   "sources.battery": { width: 48, height: 36 },
-  "sources.rail": { width: 36, height: 28 },
+  "sources.rail": { width: 54, height: 70 },
   "espressif.esp32": { width: 160, height: 300 },
   "subcircuits.esp32_devkitc_v4": { width: 220, height: 328 },
 };
@@ -371,6 +422,42 @@ export function pinLocalPosition(pinId: string, pinIndex: number, pinCount: numb
   }
   if (typeId === "connectors.junction") return { x: 0, y: 0 };
   const box = componentBox(typeId, properties);
+  if ((typeId === "switches.push" || typeId === "switches.switch") && pinCount <= 2) {
+    return { x: pinIndex % 2 === 0 ? PIN_INSET : box.width - PIN_INSET, y: 22 };
+  }
+  if (typeId === "sources.fixed_volt" && pinCount <= 1) {
+    return { x: box.width - PIN_INSET, y: box.height / 2 };
+  }
+  if (typeId === "sources.rail" && pinCount <= 1) {
+    return { x: box.width / 2, y: box.height - PIN_INSET };
+  }
+  if (typeId === "connectors.tunnel" && pinCount <= 1) {
+    // SimulIDE ancora o Tunnel na ponta da seta: o fio deve sair exatamente desse vértice, não do
+    // centro/topo do símbolo nem da extensão visual arredondada.
+    return { x: box.width - 20, y: box.height / 2 };
+  }
+  if (typeId === "meters.probe" && pinCount <= 1) {
+    // Ponta real do lead desenhado em componentSymbolSvg (line de PIN_INSET até yMid-8) -- não a
+    // posição antiga (36,14), que ficava flutuando no meio do lead, não na ponta.
+    return { x: box.width / 2, y: PIN_INSET };
+  }
+  if ((typeId === "meters.ampmeter" || typeId === "instruments.voltmeter") && pinCount >= 3) {
+    // Ponta real das "pernas" desenhadas por smallMeterDisplaySvg (rects em x=20/x=38, y=42..54) e
+    // do terminal direito (x=width-14..width, y=height/2-3..+3) -- não a posição antiga, que ficava
+    // ~4px acima da ponta visual de cada perna.
+    if (pinIndex === 0) return { x: 22.5, y: 54 };
+    if (pinIndex === 1) return { x: 40.5, y: 54 };
+    return { x: box.width, y: box.height / 2 };
+  }
+  if (typeId === "meters.freqmeter" && pinCount <= 1) {
+    return { x: PIN_INSET, y: box.height / 2 };
+  }
+  if (typeId === "meters.oscope") {
+    return { x: PIN_INSET, y: 28 + pinIndex * 28 };
+  }
+  if (typeId === "meters.logic_analyzer") {
+    return { x: PIN_INSET, y: 20 + pinIndex * 20 };
+  }
   if (pinCount <= 1) return { x: box.width / 2, y: PIN_INSET };
 
   const side = pinIndex % 2 === 0 ? PIN_INSET : box.width - PIN_INSET;
@@ -399,6 +486,88 @@ function horizontalLeads(box: ComponentBox, yMid: number): string {
   return (
     `<line x1="${PIN_INSET}" y1="${yMid}" x2="${LEAD_MARGIN}" y2="${yMid}" class="symbol-stroke"/>` +
     `<line x1="${box.width - LEAD_MARGIN}" y1="${yMid}" x2="${box.width - PIN_INSET}" y2="${yMid}" class="symbol-stroke"/>`
+  );
+}
+
+function smallMeterDisplaySvg(box: ComponentBox, unit: "A" | "V", readout: number | undefined): string {
+  return (
+    `<rect x="6" y="4" width="58" height="38" rx="3" class="meter-lcd"/>` +
+    `<text x="18" y="19" class="meter-lcd-value">${formatLcdNumber(readout)}</text>` +
+    `<text x="18" y="35" class="meter-lcd-unit">${unit}</text>` +
+    `<rect x="${box.width - 14}" y="${box.height / 2 - 3}" width="14" height="6" rx="3" fill="currentColor"/>` +
+    `<rect x="20" y="42" width="5" height="12" rx="2.5" fill="currentColor"/>` +
+    `<rect x="38" y="42" width="5" height="12" rx="2.5" fill="currentColor"/>`
+  );
+}
+
+function plotGridSvg(x: number, y: number, width: number, height: number): string {
+  return Array.from({ length: 9 }, (_, index) => {
+    const gx = x + 12 + index * ((width - 24) / 8);
+    return `<line x1="${gx.toFixed(1)}" y1="${y + 8}" x2="${gx.toFixed(1)}" y2="${y + height - 8}" class="meter-plot-grid"/>`;
+  }).join("");
+}
+
+function scopePanelSvg(properties?: Record<string, unknown>): string {
+  const histories = symbolHistoryMatrix(properties);
+  const latest = symbolReadoutArray(properties);
+  const colors = ["#f6f65a", "#d9d7ff", "#ffd06a", "#00e89a"];
+  const plotX = 104;
+  const plotY = 8;
+  const plotW = 146;
+  const plotH = 134;
+  const rows = colors.map((color, index) => {
+    const y = 16 + index * 29;
+    const label = `${formatRailVoltage(latest[index] ?? 0)} V`;
+    return (
+      `<text x="18" y="${y}" class="meter-panel-label">${escapeXmlText(label)}</text>` +
+      `<rect x="18" y="${y + 5}" width="78" height="20" rx="2" fill="${color}" stroke="#777"/>`
+    );
+  }).join("");
+  const traces = colors.map((color, index) => {
+    const history = histories[index] ?? [];
+    return `<path d="${tracePath(history, plotX + 7, plotY + 14, plotW - 14, plotH - 28)}" fill="none" stroke="${color}" stroke-width="2"/>`;
+  }).join("");
+  return (
+    `<rect x="4" y="2" width="252" height="146" rx="6" fill="#f7f7f7" stroke="currentColor" stroke-width="2"/>` +
+    rows +
+    `<rect x="18" y="122" width="78" height="20" rx="3" class="meter-expand-button"/>` +
+    `<text x="31" y="136" class="meter-panel-button">Expande</text>` +
+    `<rect x="${plotX}" y="${plotY}" width="${plotW}" height="${plotH}" rx="6" fill="#050505" stroke="currentColor" stroke-width="3"/>` +
+    plotGridSvg(plotX, plotY, plotW, plotH) +
+    traces
+  );
+}
+
+function logicAnalyzerPanelSvg(properties?: Record<string, unknown>): string {
+  const history = symbolHistoryArray(properties);
+  const latest = symbolReadoutNumber(properties) ?? 0;
+  const colors = ["#f6f65a", "#d9d7ff", "#ffd06a", "#00e89a", "#f6f65a", "#d9d7ff", "#ffd06a", "#00e89a"];
+  const plotX = 104;
+  const plotY = 8;
+  const plotW = 146;
+  const plotH = 174;
+  const rows = colors.map((color, index) => {
+    const y = 12 + index * 20;
+    return `<rect x="18" y="${y}" width="78" height="16" rx="2" fill="${color}" stroke="#777"/>`;
+  }).join("");
+  const traces = colors.map((color, channel) => {
+    const samples = history.length > 1 ? history : [latest, latest];
+    const rowY = plotY + 14 + channel * 19;
+    const points = samples.map((mask, index) => {
+      const x = plotX + 7 + ((plotW - 14) * index) / Math.max(1, samples.length - 1);
+      const high = ((mask >>> channel) & 1) === 1;
+      return `${index === 0 ? "M" : "L"} ${x.toFixed(1)} ${(rowY + (high ? 0 : 9)).toFixed(1)}`;
+    }).join(" ");
+    return `<path d="${points}" fill="none" stroke="${color}" stroke-width="2"/>`;
+  }).join("");
+  return (
+    `<rect x="4" y="2" width="252" height="208" rx="6" fill="#f7f7f7" stroke="currentColor" stroke-width="2"/>` +
+    rows +
+    `<rect x="18" y="184" width="78" height="20" rx="3" class="meter-expand-button"/>` +
+    `<text x="31" y="198" class="meter-panel-button">Expande</text>` +
+    `<rect x="${plotX}" y="${plotY}" width="${plotW}" height="${plotH}" rx="6" fill="#050505" stroke="currentColor" stroke-width="3"/>` +
+    plotGridSvg(plotX, plotY, plotW, plotH) +
+    traces
   );
 }
 
@@ -513,10 +682,14 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
       );
 
     case "connectors.tunnel":
-      return (
-        `<line x1="${midX}" y1="${PIN_INSET}" x2="${midX}" y2="${yMid - 8}" class="symbol-stroke"/>` +
-        `<circle cx="${midX}" cy="${yMid}" r="8" class="symbol-stroke" fill="none"/>`
-      );
+      {
+        const tipX = box.width - 20;
+        return (
+          `<path d="M 6 8 H ${tipX - 22} L ${tipX} ${yMid} L ${tipX - 22} ${box.height - 8} H 6 Z" ` +
+          `fill="#d7d7ec" stroke="currentColor" stroke-width="6" stroke-linejoin="round"/>` +
+          `<rect x="${tipX}" y="${yMid - 6}" width="18" height="12" rx="6" fill="currentColor"/>`
+        );
+      }
 
     case "connectors.bus":
       return (
@@ -585,10 +758,17 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
     case "other.package": {
       const border = properties?.border !== false;
       const backgroundColor = typeof properties?.backgroundColor === "string" ? properties.backgroundColor : undefined;
+      // `backgroundImageData` (achatado de `pkg.background.data` por `seedSymbolAuthoringComponents`
+      // -- `properties` não aceita objeto aninhado) -- mesma foto real que `packageBodySvg` desenha
+      // fora da sessão de autoria, só que aqui o componente é o meta "other.package" (corpo do
+      // símbolo sendo EDITADO), não o `package` resolvido de um typeId qualquer.
+      const backgroundImageData = typeof properties?.backgroundImageData === "string" ? properties.backgroundImageData : undefined;
       return (
-        (backgroundColor ? `<rect x="0" y="0" width="${box.width}" height="${box.height}" fill="${backgroundColor}"/>` : "") +
+        (backgroundImageData
+          ? `<image x="0" y="0" width="${box.width}" height="${box.height}" preserveAspectRatio="none" href="data:image/png;base64,${backgroundImageData}"/>`
+          : backgroundColor ? `<rect x="0" y="0" width="${box.width}" height="${box.height}" fill="${backgroundColor}"/>` : "") +
         (border ? `<rect x="0.5" y="0.5" width="${Math.max(0, box.width - 1)}" height="${Math.max(0, box.height - 1)}" class="symbol-stroke" fill="none"/>` : "") +
-        `<text x="4" y="11" font-size="7" fill="currentColor" opacity="0.55">PKG</text>`
+        (backgroundImageData ? "" : `<text x="4" y="11" font-size="7" fill="currentColor" opacity="0.55">PKG</text>`)
       );
     }
 
@@ -635,9 +815,31 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
         `<line x1="${box.width - PIN_INSET - 6}" y1="${yMid}" x2="${box.width - PIN_INSET + 6}" y2="${yMid}" class="symbol-stroke symbol-stroke--accent"/>`
       );
 
-    case "logic.button":
-    case "switches.push":
+    case "switches.push": {
+      const contactY = 22;
+      return (
+        `<line x1="${PIN_INSET}" y1="${contactY}" x2="17" y2="${contactY}" class="symbol-stroke"/>` +
+        `<line x1="51" y1="${contactY}" x2="${box.width - PIN_INSET}" y2="${contactY}" class="symbol-stroke"/>` +
+        `<rect x="24" y="4" width="20" height="6" rx="3" class="push-actuator-bar" fill="currentColor"/>` +
+        `<rect x="14" y="${contactY - 3}" width="16" height="6" rx="3" fill="currentColor"/>` +
+        `<rect x="38" y="${contactY - 3}" width="16" height="6" rx="3" fill="currentColor"/>` +
+        `<rect x="22" y="29" width="24" height="22" rx="4" class="push-body" fill="#dddddd" stroke="#777777" stroke-width="2"/>`
+      );
+    }
+
     case "switches.switch": {
+      const contactY = 22;
+      return (
+        `<line x1="${PIN_INSET}" y1="${contactY}" x2="17" y2="${contactY}" class="symbol-stroke"/>` +
+        `<line x1="51" y1="${contactY}" x2="${box.width - PIN_INSET}" y2="${contactY}" class="symbol-stroke"/>` +
+        `<rect x="14" y="${contactY - 3}" width="16" height="6" rx="3" fill="currentColor"/>` +
+        `<rect x="38" y="${contactY - 3}" width="16" height="6" rx="3" fill="currentColor"/>` +
+        `<line x1="27" y1="${contactY}" x2="53" y2="${contactY}" class="symbol-stroke symbol-stroke--thick switch-lever"/>` +
+        `<rect x="22" y="29" width="24" height="22" rx="4" class="switch-body" fill="#dddddd" stroke="#777777" stroke-width="2"/>`
+      );
+    }
+
+    case "logic.button": {
       const rise = box.height / 2 - 5;
       return (
         horizontalLeads(box, yMid) +
@@ -815,20 +1017,11 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
       return labelBox("555");
 
     case "instruments.voltmeter":
-      // Limitação conhecida: o plugin agora declara um 3º pino ("outPin", saída analógica da
-      // leitura -- ver devices/voltmeter/src/lib.c) renderizado pelo algoritmo GENÉRICO de
-      // pinLocalPosition (2 á esquerda/direita + 1 extra reaproveitando o lado esquerdo numa
-      // segunda linha), não pela posição declarada em device.json -- o renderizador de `package`
-      // genérico ainda não existe (Épico G do roadmap de pendências). O corpo abaixo só desenha
-      // os leads/círculo dos 2 pinos de medição; o 3º pino aparece como ponto sem lead próprio até
-      // esse renderizador existir.
-      return (
-        horizontalLeads(box, yMid) +
-        `<line x1="${x1}" y1="${yMid}" x2="${midX - 14}" y2="${yMid}" class="symbol-stroke"/>` +
-        `<line x1="${midX + 14}" y1="${yMid}" x2="${x2}" y2="${yMid}" class="symbol-stroke"/>` +
-        `<circle cx="${midX}" cy="${yMid}" r="14" class="symbol-stroke symbol-stroke--accent" fill="none"/>` +
-        `<text x="${midX}" y="${yMid + 5}" text-anchor="middle" class="symbol-text symbol-text--accent">V</text>`
-      );
+      // `device.lsconfig` não tem mais `symbolSvg` próprio (o antigo círculo+"V" tinha leads
+      // horizontais em y=24 que nunca bateram com a posição real do pino, calculada pra ESTE
+      // desenho -- ver pinLocalPosition acima). O 3º pino ("outPin", saída analógica da leitura, ver
+      // devices/voltmeter/src/lib.c) usa o terminal da direita desenhado por smallMeterDisplaySvg.
+      return smallMeterDisplaySvg(box, "V", symbolReadoutNumber(properties));
 
     // ── Medidores (pasta "Meters" do SimulIDE) ──────────────────────────────────
     case "meters.probe":
@@ -840,38 +1033,30 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
       );
 
     case "meters.ampmeter":
-      return (
-        horizontalLeads(box, yMid) +
-        `<line x1="${x1}" y1="${yMid}" x2="${midX - 14}" y2="${yMid}" class="symbol-stroke"/>` +
-        `<line x1="${midX + 14}" y1="${yMid}" x2="${x2}" y2="${yMid}" class="symbol-stroke"/>` +
-        `<circle cx="${midX}" cy="${yMid}" r="14" class="symbol-stroke symbol-stroke--accent" fill="none"/>` +
-        `<text x="${midX}" y="${yMid + 5}" text-anchor="middle" class="symbol-text symbol-text--accent">A</text>`
-      );
+      return smallMeterDisplaySvg(box, "A", symbolReadoutNumber(properties));
 
     case "meters.freqmeter":
       return (
-        `<rect x="4" y="2" width="${box.width - 8}" height="${box.height - 4}" rx="2" class="symbol-stroke" fill="none"/>` +
-        `<text x="${midX}" y="${yMid + 4}" text-anchor="middle" class="symbol-text">Hz</text>`
+        `<rect x="8" y="4" width="${box.width - 14}" height="${box.height - 8}" rx="2" class="meter-lcd"/>` +
+        `<rect x="0" y="${yMid - 3}" width="10" height="6" rx="3" fill="currentColor"/>` +
+        `<text x="16" y="${yMid + 5}" class="freq-lcd-value">${escapeXmlText(formatHz(symbolReadoutNumber(properties)))}</text>`
       );
 
     case "meters.oscope":
       // Caixa preta com uma forma de onda simplificada -- mesmo espírito do Oscope::paint (corpo
       // preenchido) sem a janela de plotagem real (ver docstring de Oscope.hpp no Core).
-      return (
-        `<rect x="2" y="2" width="${box.width - 4}" height="${box.height - 4}" rx="2" class="symbol-stroke" fill="none"/>` +
-        `<path d="M 8 ${yMid} L 16 ${yMid} L 22 ${yMid - 12} L 30 ${yMid + 12} L 38 ${yMid - 8} L ${box.width - 8} ${yMid}" class="symbol-stroke symbol-stroke--accent" fill="none"/>`
-      );
+      return scopePanelSvg(properties);
 
     case "meters.logic_analyzer":
-      return (
-        `<rect x="2" y="2" width="${box.width - 4}" height="${box.height - 4}" rx="2" class="symbol-stroke" fill="none"/>` +
-        `<path d="M 8 ${yMid + 10} L 8 ${yMid - 4} L 20 ${yMid - 4} L 20 ${yMid + 10} L 32 ${yMid + 10} L 32 ${yMid - 12} L 44 ${yMid - 12} L 44 ${yMid + 10} L ${box.width - 8} ${yMid + 10}" class="symbol-stroke symbol-stroke--accent" fill="none"/>`
-      );
+      return logicAnalyzerPanelSvg(properties);
 
     // ── Fontes (pasta "Sources" do SimulIDE) ────────────────────────────────────
-    case "sources.fixed_volt":
-      // Botão liga/desliga -- mesmo roundedRect colorido do FixedVolt::paint original.
-      return `<rect x="${(box.width - 16) / 2}" y="${(box.height - 16) / 2}" width="16" height="16" rx="2" class="symbol-stroke" fill="none"/>`;
+    case "sources.fixed_volt": {
+      return (
+        `<rect x="18" y="7" width="34" height="40" rx="6" class="fixed-volt-body" fill="#dddddd" stroke="#777777" stroke-width="4"/>` +
+        `<rect x="52" y="22" width="18" height="10" rx="5" class="fixed-volt-terminal" fill="currentColor"/>`
+      );
+    }
 
     case "sources.clock":
       // Pulso quadrado -- mesma sequência exata de drawLine do Clock::paint original.
@@ -927,9 +1112,15 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
         `<line x1="${midX + 8}" y1="${yMid - 3}" x2="${midX + 8}" y2="${yMid + 3}" class="symbol-stroke"/>`
       );
 
-    case "sources.rail":
-      // Seta/bandeira -- mesmo polígono do Rail::paint original (drawPolygon de 4 pontos).
-      return `<path d="M ${midX - 5} ${yMid - 8} L ${midX - 5} ${yMid + 8} L ${midX + 9} ${yMid + 1} L ${midX + 9} ${yMid - 1} Z" class="symbol-stroke" fill="none"/>`;
+    case "sources.rail": {
+      const voltage = typeof properties?.voltage === "number" ? properties.voltage : 5.0;
+      const label = `${formatRailVoltage(voltage)} V`;
+      return (
+        `<path d="M ${midX - 20} 20 L ${midX + 20} 20 L ${midX + 8} 48 L ${midX - 8} 48 Z" fill="#ffa500" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/>` +
+        `<rect x="${midX - 5}" y="46" width="10" height="18" rx="5" fill="currentColor"/>` +
+        `<text x="${midX}" y="17" text-anchor="middle" class="rail-voltage-label">${escapeXmlText(label)}</text>`
+      );
+    }
 
     default:
       return horizontalLeads(box, yMid) + `<rect x="${x1}" y="${yMid - 10}" width="${x2 - x1}" height="20" class="symbol-stroke" fill="none"/>`;

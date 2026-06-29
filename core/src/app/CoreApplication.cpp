@@ -273,10 +273,18 @@ void registerBuiltinComponents(ComponentRegistry& reg, registry::ComponentMetada
 
     const auto registerSwitchLike = [&](const std::string& typeId, const std::string& label, size_t pinCount) {
         reg.registerFactory(typeId, [&, typeId, pinCount](const ComponentParams& p) {
+            std::string key;
+            if (const auto it = p.properties.find("key"); it != p.properties.end()) {
+                if (const std::string* value = std::get_if<std::string>(&it->second)) key = *value;
+            }
             return std::make_unique<components::SimulideSwitch>(
-                typeId, makePinVector(p, pinCount), p.property("closed", false), p.property("normallyClosed", false));
+                typeId, makePinVector(p, pinCount), p.property("closed", false), p.property("normallyClosed", false),
+                p.property("doubleThrow", false), p.property("poles", 1.0), std::move(key));
         });
-        registerBuiltinMetadata(typeId, label, components::SimulideSwitch::propertySchema(), englishName(label));
+        registerBuiltinMetadata(typeId, label,
+                                typeId == "switches.push" ? components::SimulideSwitch::pushPropertySchema()
+                                                          : components::SimulideSwitch::propertySchema(),
+                                englishName(label));
     };
     registerSwitchLike("switches.push", "Push", 2);
     registerSwitchLike("switches.switch", "Switch (all)", 2);

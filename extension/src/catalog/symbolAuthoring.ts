@@ -77,6 +77,12 @@ export function seedSymbolAuthoringComponents(pkg: PackageDescriptor, originX = 
 
   const packageProperties: Record<string, string | number | boolean> = { width: pkg.width, height: pkg.height, border: pkg.border ?? true };
   if (pkg.background?.kind === "color" && pkg.background.value) packageProperties.backgroundColor = pkg.background.value;
+  // `properties` só aceita string/number/boolean (sem objeto aninhado) -- a foto em base64 cabe
+  // direto como string, só achatada num nome próprio em vez de `background.data`. Sem isto, a sessão
+  // de autoria (componente `other.package`, ver componentSymbols.ts) nunca via a imagem real (só
+  // `packageSymbolSvg`/uso normal do subcircuito via, que lê `pkg.background` direto -- caminho de
+  // renderização DIFERENTE, ver `componentSymbols.ts::componentSymbolSvg` caso "other.package").
+  if (pkg.background?.kind === "image" && pkg.background.data) packageProperties.backgroundImageData = pkg.background.data;
   components.push(baseComponent(nextComponentId("package", 0), "other.package", originX, originY, 0, packageProperties));
 
   (pkg.shapes ?? []).forEach((shape, index) => {
@@ -118,11 +124,20 @@ function toWebviewVisual(visual: VisualPosition | undefined, index: number): Req
 export function seedSubcircuitInternalComponents(components: InternalComponentSeed[], wires: InternalWireSeed[]): { components: WebviewComponentModel[]; wires: WebviewWireModel[] } {
   const seededComponents: WebviewComponentModel[] = components.map((component, index) => {
     const visual = toWebviewVisual(component.visual, index);
+    // `connectors.tunnel` mostra o nome do NET (`properties.name`, ex: "G23") -- é o que identifica
+    // a ligação pra quem está editando; o id interno ("tunnel_G23") é só um detalhe de
+    // implementação. Demais componentes mostram o próprio id (sem nome de net pra mostrar).
+    // `showId: true` torna o rótulo visível por padrão -- sem isso (`renderComponent` em main.ts)
+    // todo componente do circuito interno aparecia sem nenhum texto, só o símbolo genérico, o que
+    // tornava a tela de "Abrir Subcircuito" difícil de entender (várias formas iguais sem dizer o
+    // que são).
+    const tunnelName = component.typeId === "connectors.tunnel" && typeof component.properties.name === "string" ? component.properties.name : undefined;
     const model: WebviewComponentModel = {
       id: component.id,
       typeId: component.typeId,
-      label: component.id,
+      label: tunnelName ?? component.id,
       hidden: false,
+      showId: true,
       x: Math.round(visual.x),
       y: Math.round(visual.y),
       rotation: visual.rotation,

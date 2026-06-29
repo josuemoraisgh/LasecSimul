@@ -169,11 +169,11 @@ html, body {
   width: 100%;
   flex: 1 1 auto;
   min-height: 0;
-  background-color: #e6eaef;
+  background-color: #ffffdd;
   background-image:
-    linear-gradient(rgba(120, 134, 150, 0.12) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(120, 134, 150, 0.12) 1px, transparent 1px);
-  background-size: 24px 24px;
+    linear-gradient(#d1d1c8 2px, transparent 2px),
+    linear-gradient(90deg, #d1d1c8 2px, transparent 2px);
+  background-size: 23px 23px;
 }
 
 /** Viewport fixo (`.canvas`) nunca se move/escala; este wrapper recebe `translate()`+`scale()` via JS
@@ -281,6 +281,56 @@ html, body {
   cursor: grabbing;
 }
 
+.component--push,
+.component--switch,
+.component--fixed-volt {
+  cursor: pointer;
+}
+
+.component__symbol--push .push-actuator-bar,
+.component__symbol--push .push-body {
+  transition: transform 80ms ease-out, fill 80ms ease-out, stroke 80ms ease-out;
+}
+
+.component__symbol--push-pressed .push-actuator-bar {
+  transform: translateY(7px);
+}
+
+.component__symbol--push-pressed .push-body {
+  transform: translateY(2px);
+  fill: #62d67b;
+  stroke: #24803a;
+}
+
+.component__symbol--switch .switch-lever {
+  transform: rotate(-35deg);
+  transform-box: view-box;
+  transform-origin: 27px 22px;
+  transition: transform 100ms ease-out;
+}
+
+.component__symbol--switch .switch-body {
+  transition: fill 100ms ease-out, stroke 100ms ease-out;
+}
+
+.component__symbol--switch-closed .switch-lever {
+  transform: rotate(0deg);
+}
+
+.component__symbol--switch-closed .switch-body {
+  fill: #62d67b;
+  stroke: #24803a;
+}
+
+.component__symbol--fixed-volt .fixed-volt-body {
+  transition: fill 100ms ease-out, stroke 100ms ease-out;
+}
+
+.component__symbol--fixed-volt-on .fixed-volt-body {
+  fill: #c99a3d;
+  stroke: #5b513f;
+}
+
 .component__symbol {
   display: block;
   width: 100%;
@@ -291,7 +341,7 @@ html, body {
 }
 
 .component--voltmeter .component__symbol {
-  color: #d9e2f3;
+  color: var(--text);
 }
 
 .symbol-stroke {
@@ -337,6 +387,122 @@ html, body {
   fill: var(--accent);
   stroke: var(--accent);
   stroke-width: 2;
+}
+
+.component--fixed-volt .pin-terminal {
+  fill: var(--text);
+  stroke: var(--text);
+}
+
+.component--fixed-volt .pin-terminal:hover {
+  fill: var(--text);
+  r: 4.5;
+}
+
+.component--rail .pin-terminal {
+  fill: var(--text);
+  stroke: var(--text);
+}
+
+.component--rail .pin-terminal:hover {
+  fill: var(--text);
+  r: 4.5;
+}
+
+.component--tunnel .pin-terminal {
+  fill: var(--text);
+  stroke: var(--text);
+}
+
+.component--tunnel .pin-terminal:hover {
+  fill: var(--text);
+  r: 4.5;
+}
+
+.component--meter .pin-terminal {
+  fill: var(--text);
+  stroke: var(--text);
+}
+
+.component--meter .pin-terminal:hover {
+  fill: var(--text);
+  r: 4.5;
+}
+
+.component--meters-probe .pin-terminal {
+  fill: #ecebff;
+  stroke: var(--text);
+  r: 10;
+}
+
+.component--meters-probe .pin-terminal:hover {
+  fill: #ecebff;
+  r: 10;
+}
+
+.meter-lcd {
+  fill: #050505;
+  stroke: #050505;
+}
+
+.meter-lcd-value,
+.meter-lcd-unit,
+.freq-lcd-value {
+  fill: #ffff00;
+  stroke: none;
+  font-family: "Consolas", "Courier New", monospace;
+  font-weight: 700;
+}
+
+.meter-lcd-value {
+  font-size: 14px;
+}
+
+.meter-lcd-unit {
+  font-size: 16px;
+}
+
+.freq-lcd-value {
+  font-size: 16px;
+}
+
+.probe-voltage-label {
+  fill: #8d0000;
+  stroke: none;
+  font: 11px "Segoe UI", sans-serif;
+}
+
+.meter-panel-label,
+.meter-panel-button {
+  fill: #000;
+  stroke: none;
+  font: 11px "Segoe UI", sans-serif;
+  font-weight: 700;
+}
+
+.meter-panel-button {
+  font-size: 12px;
+}
+
+.meter-plot-grid {
+  stroke: #343434;
+  stroke-width: 2;
+}
+
+.meter-expand-button {
+  fill: #ededed;
+  stroke: #999;
+  cursor: pointer;
+}
+
+.meter-expand-button:hover {
+  fill: #d8d8d8;
+}
+
+.rail-voltage-label {
+  fill: #8d0000;
+  stroke: none;
+  font: 20px "Segoe UI", sans-serif;
 }
 
 .selection-overlay {
@@ -385,32 +551,34 @@ html, body {
 }
 
 .property-dialog {
-  min-width: 360px;
-  max-width: 420px;
+  width: 322px;
+  min-width: 322px;
+  max-width: 322px;
   padding: 0;
   border: 1px solid #b8b8b8;
-  border-radius: 8px;
-  background: #efefef;
-  color: #202020;
-  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.42);
+  border-radius: 2px;
+  background: #eeeeee;
+  color: #000;
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
 }
 
 .property-dialog::backdrop {
-  background: rgba(0, 0, 0, 0.5);
+  background: transparent;
 }
 
 .property-sheet {
   display: grid;
-  gap: 10px;
-  padding: 0 10px 10px;
+  gap: 8px;
+  padding: 0 12px 12px;
+  font-size: 12px;
 }
 
 .property-sheet__titlebar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin: 0 -10px;
-  padding: 6px 10px;
+  margin: 0 -12px;
+  padding: 4px 8px;
   border-bottom: 1px solid #d2d2d2;
   background: linear-gradient(#f8f8f8, #ebebeb);
 }
@@ -421,7 +589,7 @@ html, body {
 }
 
 .property-sheet__window-close {
-  width: 24px;
+  width: 26px;
   height: 24px;
   border: 1px solid #cfcfcf;
   background: #e1e1e1;
@@ -433,13 +601,13 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
   padding-top: 6px;
 }
 
 .property-sheet__type {
   color: #1847c7;
-  font-size: 18px;
+  font-size: 16px;
 }
 
 .property-sheet__actions {
@@ -449,8 +617,8 @@ html, body {
 }
 
 .property-sheet__button {
-  min-width: 76px;
-  height: 28px;
+  min-width: 80px;
+  height: 25px;
   border: 1px solid #b5b5b5;
   border-radius: 3px;
   background: linear-gradient(#fdfdfd, #dfdfdf);
@@ -467,25 +635,25 @@ html, body {
 .property-sheet__show-toggle {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 14px;
+  gap: 6px;
+  font-size: 11px;
   color: #252525;
 }
 
 .property-sheet__title-row,
 .property-sheet__field-row {
   display: grid;
-  grid-template-columns: 72px 1fr;
+  grid-template-columns: 82px 1fr;
   align-items: center;
-  gap: 8px;
-  font-size: 14px;
-  color: #212121;
+  gap: 6px;
+  font-size: 11px;
+  color: #000;
 }
 
 .property-sheet__title-row input,
 .property-sheet__field-input {
-  height: 28px;
-  padding: 4px 8px;
+  height: 24px;
+  padding: 2px 5px;
   border: 1px solid #b8b8b8;
   background: #fff;
   color: #202020;
@@ -494,13 +662,13 @@ html, body {
 .property-sheet__tabs {
   display: flex;
   align-items: center;
-  gap: 4px;
-  margin-top: 2px;
+  gap: 0;
+  margin-top: 4px;
 }
 
 .property-sheet__tab {
-  min-width: 86px;
-  padding: 7px 12px;
+  min-width: 72px;
+  padding: 8px 12px;
   border: 1px solid #bababa;
   border-bottom: none;
   border-top-left-radius: 4px;
@@ -517,8 +685,8 @@ html, body {
 .property-sheet__pages {
   border: 1px solid #bababa;
   background: #f7f7f7;
-  min-height: 190px;
-  padding: 12px;
+  min-height: 154px;
+  padding: 14px 12px;
 }
 
 .property-sheet__group {
@@ -526,20 +694,20 @@ html, body {
   padding: 0;
   border: none;
   display: grid;
-  gap: 12px;
+  gap: 11px;
 }
 
 .property-sheet__check-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-size: 14px;
-  color: #1d1d1d;
+  gap: 8px;
+  font-size: 11px;
+  color: #000;
 }
 
 .property-sheet__check-row input {
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   margin: 0;
 }
 
@@ -552,22 +720,57 @@ html, body {
 .context-menu {
   position: fixed;
   z-index: 30;
-  min-width: 150px;
+  min-width: 414px;
   padding: 4px;
   border: 1px solid #b8b8b8;
-  background: #f0f0f0;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  background: #fbfbfb;
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.24);
 }
 
 .context-menu__item {
-  display: block;
+  display: grid;
+  grid-template-columns: 24px 1fr 112px;
+  align-items: center;
+  gap: 6px;
   width: 100%;
-  padding: 7px 10px;
+  min-height: 28px;
+  padding: 4px 8px;
   border: none;
   background: transparent;
-  color: #202020;
+  color: #000;
   text-align: left;
   cursor: pointer;
+  font: 14px "Segoe UI", sans-serif;
+}
+
+.context-menu__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  color: #555;
+}
+
+.context-menu__icon svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.context-menu__shortcut {
+  color: #000;
+  text-align: right;
+}
+
+.context-menu__separator {
+  height: 1px;
+  margin: 4px 0;
+  background: #c8c8c8;
 }
 
 .context-menu__item:hover:not(:disabled) {

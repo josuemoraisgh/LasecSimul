@@ -1,4 +1,4 @@
-import { WEBVIEW_MESSAGE_VERSION, HostToWebviewMessage, SimulationStatus, SymbolAuthoringKind, WebviewToHostMessage } from "./messages.js";
+import { WEBVIEW_MESSAGE_VERSION, ComponentReadoutValue, HostToWebviewMessage, SimulationStatus, SymbolAuthoringKind, WebviewToHostMessage } from "./messages.js";
 import { PropertySchemaEntry, WebviewComponentModel, WebviewProjectState, WebviewWireModel } from "./model.js";
 import { PIN_RADIUS, componentBox, componentSymbolSvg, hasRealPinPosition, packageSymbolSvg, pinLocalPosition, registerPackage } from "./componentSymbols.js";
 import {
@@ -87,15 +87,21 @@ const UI_TEXT = {
     paused: "Pausado",
     stopped: "Parado",
     properties: "Propriedades",
+    copy: "Copiar",
+    cut: "Cortar",
+    paste: "Colar",
+    remove: "Remover",
     delete: "Excluir",
     deleteWire: "Excluir fio",
     rotate: "Rotacionar",
-    rotateCw: "Rotacionar CW",
-    rotateCcw: "Rotacionar CCW",
-    rotate180: "Rotacionar 180°",
+    rotateCw: "Girar no sentido horario",
+    rotateCcw: "Girar no sentido anti-horario",
+    rotate180: "Girar 180°",
+    flipHorizontal: "Inverter horizontalmente",
+    flipVertical: "Inverter verticalmente",
     help: "Ajuda",
     show: "Mostrar",
-    title: "Titulo:",
+    title: "Título:",
     visual: "Visual",
     principal: "Principal",
     shortcut: "Atalho",
@@ -124,12 +130,18 @@ const UI_TEXT = {
     paused: "Paused",
     stopped: "Stopped",
     properties: "Properties",
+    copy: "Copy",
+    cut: "Cut",
+    paste: "Paste",
+    remove: "Remove",
     delete: "Delete",
     deleteWire: "Delete wire",
     rotate: "Rotate",
-    rotateCw: "Rotate CW",
-    rotateCcw: "Rotate CCW",
+    rotateCw: "Rotate clockwise",
+    rotateCcw: "Rotate counter-clockwise",
     rotate180: "Rotate 180°",
+    flipHorizontal: "Flip horizontally",
+    flipVertical: "Flip vertically",
     help: "Help",
     show: "Show",
     title: "Title:",
@@ -155,7 +167,16 @@ function t(key: keyof typeof UI_TEXT["pt-BR"]): string {
   return UI_TEXT[currentLocale()][key];
 }
 
-let readoutsByComponentId: Record<string, number> = {};
+let readoutsByComponentId: Record<string, ComponentReadoutValue> = {};
+let scopeHistoryByComponentId: Record<string, number[][]> = {};
+let logicHistoryByComponentId: Record<string, number[]> = {};
+// `pollInstrumentReadouts` (extension.ts) tira uma amostra a cada 300ms (setInterval real) -- é a
+// ÚNICA base de tempo real que temos pra eixo X da janela "Expande" (osciloscópio/analisador não
+// têm buffer de alta frequência no Core, só o estado mais recente por amostra de leitura, ver
+// `core/src/components/meters/Oscope.hpp`). Aumentado de 96 pra 600 amostras (~3min de histórico)
+// pra dar faixa de zoom (Divisão de Tempo) razoável na janela expandida.
+const INSTRUMENT_POLL_INTERVAL_MS = 300;
+const INSTRUMENT_HISTORY_DEPTH = 600;
 let voltagesByWireId: Record<string, number> = {};
 let pendingWirePreviewTarget: Point | undefined;
 let pendingWireRoute: Point[] = [];
@@ -192,6 +213,8 @@ let selectedWireCorner:
 let simulationStatus: SimulationStatus = "stopped";
 let activePropertyComponentId: string | undefined;
 let propertyDialogShowAll = false;
+let clipboardItems: { components: WebviewComponentModel[]; wires: WebviewWireModel[] } | undefined;
+const activePushShortcutIds = new Set<string>();
 
 const propertyDialog = document.createElement("dialog");
 propertyDialog.className = "property-dialog";
@@ -467,24 +490,87 @@ function refreshOpenPropertyDialog(): void {
   openPropertyDialog(component);
 }
 
-function showContextMenu(event: MouseEvent, items: Array<{ label: string; onClick: () => void; disabled?: boolean }>): void {
+type ContextMenuIconKind = "copy" | "cut" | "remove" | "properties" | "rotateCw" | "rotateCcw" | "rotate180" | "flipHorizontal" | "flipVertical";
+
+type ContextMenuItem =
+  | { kind: "separator" }
+  | { label: string; onClick: () => void; disabled?: boolean; icon?: ContextMenuIconKind; shortcut?: string };
+
+function renderContextMenuIcon(kind?: ContextMenuIconKind): HTMLSpanElement {
+  const wrapper = document.createElement("span");
+  wrapper.className = "context-menu__icon";
+  if (!kind) return wrapper;
+
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+
+  switch (kind) {
+    case "copy":
+      svg.innerHTML = '<rect x="8" y="7" width="10" height="13" rx="1.5"></rect><path d="M6 17H5.5A1.5 1.5 0 0 1 4 15.5v-10A1.5 1.5 0 0 1 5.5 4h8A1.5 1.5 0 0 1 15 5.5V6"></path>';
+      break;
+    case "cut":
+      svg.innerHTML = '<circle cx="6.5" cy="6.5" r="2"></circle><circle cx="6.5" cy="17.5" r="2"></circle><path d="M8.2 7.7 19 18"></path><path d="M8.2 16.3 19 6"></path>';
+      break;
+    case "remove":
+      svg.innerHTML = '<path d="M7 7l10 10"></path><path d="M17 7 7 17"></path>';
+      break;
+    case "properties":
+      svg.innerHTML = '<circle cx="12" cy="12" r="3"></circle><path d="M12 3v3"></path><path d="M12 18v3"></path><path d="M3 12h3"></path><path d="M18 12h3"></path><path d="m5.6 5.6 2.1 2.1"></path><path d="m16.3 16.3 2.1 2.1"></path><path d="m18.4 5.6-2.1 2.1"></path><path d="m7.7 16.3-2.1 2.1"></path>';
+      break;
+    case "rotateCw":
+      svg.innerHTML = '<path d="M17 7h4V3"></path><path d="M20 7a8 8 0 1 0 1 5"></path>';
+      break;
+    case "rotateCcw":
+      svg.innerHTML = '<path d="M7 7H3V3"></path><path d="M4 7a8 8 0 1 1-1 5"></path>';
+      break;
+    case "rotate180":
+      svg.innerHTML = '<path d="M17 8a5 5 0 0 0-10 0v7"></path><path d="m4 12 3 3 3-3"></path><path d="M14 17h6"></path>';
+      break;
+    case "flipHorizontal":
+      svg.innerHTML = '<path d="M12 4v16"></path><path d="M4 12h16"></path><path d="m8 8-4 4 4 4"></path><path d="m16 8 4 4-4 4"></path>';
+      break;
+    case "flipVertical":
+      svg.innerHTML = '<path d="M4 12h16"></path><path d="M12 4v16"></path><path d="m8 8 4-4 4 4"></path><path d="m8 16 4 4 4-4"></path>';
+      break;
+  }
+
+  wrapper.appendChild(svg);
+  return wrapper;
+}
+
+function showContextMenu(event: MouseEvent, items: ContextMenuItem[]): void {
   event.preventDefault();
   event.stopPropagation();
   contextMenu.innerHTML = "";
-  if (items.length === 0) {
+  if (items.length === 0 || items.every((item) => "kind" in item && item.kind === "separator")) {
     hideContextMenu();
     return;
   }
 
   for (const item of items) {
+    if ("kind" in item && item.kind === "separator") {
+      const separator = document.createElement("div");
+      separator.className = "context-menu__separator";
+      contextMenu.appendChild(separator);
+      continue;
+    }
+    const action = item as Extract<ContextMenuItem, { label: string }>;
     const button = document.createElement("button");
     button.type = "button";
     button.className = "context-menu__item";
-    button.textContent = item.label;
-    button.disabled = item.disabled ?? false;
+    button.disabled = action.disabled ?? false;
+    const icon = renderContextMenuIcon(action.icon);
+    const label = document.createElement("span");
+    label.className = "context-menu__label";
+    label.textContent = action.label;
+    const shortcut = document.createElement("span");
+    shortcut.className = "context-menu__shortcut";
+    shortcut.textContent = action.shortcut ?? "";
+    button.append(icon, label, shortcut);
     button.addEventListener("click", () => {
       hideContextMenu();
-      item.onClick();
+      action.onClick();
     });
     contextMenu.appendChild(button);
   }
@@ -822,6 +908,7 @@ function render(): void {
 
   canvas.appendChild(canvasContent);
   app.append(canvas);
+  renderInstrumentPopups();
 }
 
 /** Componentes/fios cujas caixas (canvas-local, sem zoom) se sobrepõem ao retângulo do marquee --
@@ -868,6 +955,98 @@ function deleteSelectedItems(): void {
     send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestRemoveComponent", componentId });
   }
   clearSelection();
+}
+
+function cloneComponent(component: WebviewComponentModel): WebviewComponentModel {
+  return {
+    ...component,
+    pins: component.pins.map((pin) => ({ ...pin })),
+    properties: { ...component.properties },
+  };
+}
+
+function cloneWire(wire: WebviewWireModel): WebviewWireModel {
+  return {
+    ...wire,
+    from: { ...wire.from },
+    to: { ...wire.to },
+    points: wire.points?.map((point) => ({ ...point })),
+  };
+}
+
+function newComponentId(): string {
+  return `component-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+}
+
+function newWireId(): string {
+  return `wire-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+}
+
+function copySelectedItems(): boolean {
+  const selectedComponentIds = new Set(state.selectedComponentIds);
+  const components = state.components.filter((component) => selectedComponentIds.has(component.id)).map(cloneComponent);
+  if (components.length === 0) return false;
+
+  const selectedWireIds = new Set(state.selectedWireIds);
+  const wires = state.wires
+    .filter((wire) =>
+      (selectedWireIds.has(wire.id) || (selectedComponentIds.has(wire.from.componentId) && selectedComponentIds.has(wire.to.componentId))) &&
+      selectedComponentIds.has(wire.from.componentId) &&
+      selectedComponentIds.has(wire.to.componentId)
+    )
+    .map(cloneWire);
+
+  clipboardItems = { components, wires };
+  return true;
+}
+
+function cutSelectedItems(): void {
+  if (!copySelectedItems()) return;
+  deleteSelectedItems();
+}
+
+function pasteClipboardItems(): void {
+  if (!clipboardItems || clipboardItems.components.length === 0) return;
+
+  const idMap = new Map<string, string>();
+  const stagedComponents = [...state.components];
+  const components = clipboardItems.components.map((source) => {
+    const component = cloneComponent(source);
+    const descriptor = state.catalog.find((entry) => entry.typeId === component.typeId);
+    const baseLabel = descriptor?.label ?? component.typeId;
+    const nextId = newComponentId();
+    idMap.set(component.id, nextId);
+    component.id = nextId;
+    component.label = nextIndexedLabel(component.typeId, baseLabel, stagedComponents);
+    component.x += WIRE_GRID_SIZE;
+    component.y += WIRE_GRID_SIZE;
+    if (component.typeId === "switches.push") component.properties.closed = false;
+    stagedComponents.push(component);
+    return component;
+  });
+
+  const wires = clipboardItems.wires.flatMap((source) => {
+    const fromId = idMap.get(source.from.componentId);
+    const toId = idMap.get(source.to.componentId);
+    if (!fromId || !toId) return [];
+    const wire = cloneWire(source);
+    wire.id = newWireId();
+    wire.from = { ...wire.from, componentId: fromId };
+    wire.to = { ...wire.to, componentId: toId };
+    wire.points = wire.points?.map((point) => ({ x: point.x + WIRE_GRID_SIZE, y: point.y + WIRE_GRID_SIZE }));
+    return [wire];
+  });
+
+  state = {
+    ...state,
+    components: [...state.components, ...components],
+    wires: [...state.wires, ...wires],
+    selectedComponentIds: components.map((component) => component.id),
+    selectedWireIds: wires.map((wire) => wire.id),
+  };
+  vscode?.setState(state);
+  send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestInsertItems", components, wires });
+  render();
 }
 
 function wireClass(wireId: string): string {
@@ -1609,10 +1788,550 @@ function refreshWireColors(): void {
   }
 }
 
-function voltmeterReadoutText(component: WebviewComponentModel): string {
+function numericReadout(component: WebviewComponentModel): number | undefined {
   const readout = readoutsByComponentId[component.id];
+  return typeof readout === "number" ? readout : undefined;
+}
+
+function usesEmbeddedValueLabel(typeId: string): boolean {
+  return typeId === "sources.fixed_volt" || typeId === "sources.rail" || typeId === "instruments.voltmeter" || typeId.startsWith("meters.");
+}
+
+function voltmeterReadoutText(component: WebviewComponentModel): string {
+  const readout = numericReadout(component);
   if (typeof readout === "number") return `${readout.toFixed(3)} V`;
   return simulationStatus === "running" ? "... V" : "0.000 V";
+}
+
+function runtimeSymbolProperties(component: WebviewComponentModel): Record<string, unknown> {
+  const readout = readoutsByComponentId[component.id];
+  const scopeHistory = scopeHistoryByComponentId[component.id];
+  const logicHistory = logicHistoryByComponentId[component.id];
+  if (readout === undefined && !scopeHistory && !logicHistory) return component.properties;
+  return {
+    ...component.properties,
+    ...(readout === undefined ? {} : { __readout: readout }),
+    ...(scopeHistory ? { __history: scopeHistory } : {}),
+    ...(logicHistory ? { __history: logicHistory } : {}),
+  };
+}
+
+function updateReadoutHistories(readouts: Record<string, ComponentReadoutValue>): void {
+  const activeIds = new Set(state.components.map((component) => component.id));
+  const scopeHistories: Record<string, number[][]> = {};
+  const logicHistories: Record<string, number[]> = {};
+  for (const [componentId, history] of Object.entries(scopeHistoryByComponentId)) {
+    if (activeIds.has(componentId)) scopeHistories[componentId] = history;
+  }
+  for (const [componentId, history] of Object.entries(logicHistoryByComponentId)) {
+    if (activeIds.has(componentId)) logicHistories[componentId] = history;
+  }
+  for (const component of state.components) {
+    const readout = readouts[component.id];
+    if (component.typeId === "meters.oscope" && Array.isArray(readout)) {
+      const previous = scopeHistoryByComponentId[component.id] ?? [[], [], [], []];
+      scopeHistories[component.id] = [0, 1, 2, 3].map((channel) => {
+        const history = [...(previous[channel] ?? []), Number(readout[channel] ?? 0)];
+        return history.slice(-INSTRUMENT_HISTORY_DEPTH);
+      });
+    }
+    if (component.typeId === "meters.logic_analyzer" && typeof readout === "number") {
+      const history = [...(logicHistoryByComponentId[component.id] ?? []), readout >>> 0];
+      logicHistories[component.id] = history.slice(-INSTRUMENT_HISTORY_DEPTH);
+    }
+  }
+  scopeHistoryByComponentId = scopeHistories;
+  logicHistoryByComponentId = logicHistories;
+  renderInstrumentPopups();
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// Janela "Expande" do osciloscópio/analisador lógico -- igual ao SimulIDE real (OscWidget popup
+// flutuante, independente do zoom/pan do canvas principal). Reaproveita o MESMO histórico de
+// amostras que já alimenta a pré-visualização pequena (`scopeHistoryByComponentId`/
+// `logicHistoryByComponentId`, ver `updateReadoutHistories`) -- só desenha maior, com controles.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+interface ScopeChannelSettings {
+  mode: "auto" | "trigger" | "hide";
+  voltDiv: number;
+  voltPos: number;
+}
+
+interface ScopePopupState {
+  kind: "oscope";
+  componentId: string;
+  x: number;
+  y: number;
+  activeTab: 0 | 1 | 2 | 3 | "all";
+  timeDivMs: number;
+  timePosMs: number;
+  tracks: 1 | 2 | 4;
+  channels: ScopeChannelSettings[];
+}
+
+interface LogicPopupState {
+  kind: "logic";
+  componentId: string;
+  x: number;
+  y: number;
+  timeDivMs: number;
+  timePosMs: number;
+  hiddenChannels: boolean[];
+  triggerChannel: number | "none";
+  thresholdUp: number;
+  thresholdDown: number;
+}
+
+type InstrumentPopupState = ScopePopupState | LogicPopupState;
+
+const instrumentPopups = new Map<string, InstrumentPopupState>();
+const INSTRUMENT_CHANNEL_COLORS = ["#f6f65a", "#d9d7ff", "#ffd06a", "#00e89a", "#f6f65a", "#d9d7ff", "#ffd06a", "#00e89a"];
+
+const instrumentPopupLayer = document.createElement("div");
+instrumentPopupLayer.className = "instrument-popup-layer";
+document.body.appendChild(instrumentPopupLayer);
+
+function defaultScopePopupState(componentId: string, x: number, y: number): ScopePopupState {
+  return {
+    kind: "oscope",
+    componentId,
+    x,
+    y,
+    activeTab: "all",
+    timeDivMs: 1000,
+    timePosMs: 0,
+    tracks: 4,
+    channels: [0, 1, 2, 3].map(() => ({ mode: "auto", voltDiv: 1, voltPos: 0 })),
+  };
+}
+
+function defaultLogicPopupState(componentId: string, x: number, y: number): LogicPopupState {
+  return {
+    kind: "logic",
+    componentId,
+    x,
+    y,
+    timeDivMs: 1000,
+    timePosMs: 0,
+    hiddenChannels: Array.from({ length: 8 }, () => false),
+    triggerChannel: "none",
+    thresholdUp: 2.5,
+    thresholdDown: 2.5,
+  };
+}
+
+function toggleInstrumentPopup(component: WebviewComponentModel): void {
+  if (instrumentPopups.has(component.id)) {
+    instrumentPopups.delete(component.id);
+  } else {
+    const cascadeOffset = (instrumentPopups.size % 6) * 28;
+    if (component.typeId === "meters.oscope") {
+      instrumentPopups.set(component.id, defaultScopePopupState(component.id, 90 + cascadeOffset, 90 + cascadeOffset));
+    } else if (component.typeId === "meters.logic_analyzer") {
+      instrumentPopups.set(component.id, defaultLogicPopupState(component.id, 90 + cascadeOffset, 90 + cascadeOffset));
+    }
+  }
+  renderInstrumentPopups();
+}
+
+function closeInstrumentPopup(componentId: string): void {
+  instrumentPopups.delete(componentId);
+  renderInstrumentPopups();
+}
+
+/** Acha o índice (na história COMPLETA) da transição mais recente cruzando o threshold "up" --
+ * "trigger" de verdade seria por borda configurável por canal; aqui simplificado pra borda de
+ * subida (mesmo papel do trigger de um osciloscópio real: UM trigger decide o alinhamento de TODOS
+ * os traços exibidos, não um por canal). `undefined` se não há nenhuma transição na história
+ * disponível ainda (cai pro alinhamento "auto", ancorado no fim do buffer). */
+function findTriggerAnchorIndex(history: number[], thresholdUp: number): number | undefined {
+  for (let i = history.length - 1; i > 0; i--) {
+    if (history[i - 1] < thresholdUp && history[i] >= thresholdUp) return i;
+  }
+  return undefined;
+}
+
+/** Janela de amostras visível no plot, a partir de Divisão/Posição de Tempo (ambos em "ms", mas a
+ * única base de tempo real disponível é o intervalo de poll de 300ms -- ver comentário em
+ * `INSTRUMENT_POLL_INTERVAL_MS`). `anchorIndex` (índice absoluto na história completa) centraliza
+ * a janela ali em vez de ancorar no fim -- usado pelo modo "trigger". */
+function visibleSampleWindow(historyLength: number, timeDivMs: number, timePosMs: number, anchorIndex?: number, divisions = 10): { start: number; end: number } {
+  const samplesPerDiv = Math.max(1, Math.round(timeDivMs / INSTRUMENT_POLL_INTERVAL_MS));
+  const windowSize = Math.max(2, samplesPerDiv * divisions);
+  const posSamples = Math.round(timePosMs / INSTRUMENT_POLL_INTERVAL_MS);
+  if (anchorIndex !== undefined) {
+    const center = anchorIndex + posSamples;
+    const start = Math.max(0, center - Math.floor(windowSize / 2));
+    return { start, end: Math.min(historyLength - 1, start + windowSize - 1) };
+  }
+  const end = Math.max(0, historyLength - 1 - posSamples);
+  const start = Math.max(0, end - windowSize + 1);
+  return { start, end };
+}
+
+function instrumentPlotPolyline(samples: number[], plotW: number, valueToY: (value: number) => number): string {
+  if (samples.length === 0) return "";
+  return samples
+    .map((value, index) => `${(index === 0 ? "M" : "L")} ${((index / Math.max(1, samples.length - 1)) * plotW).toFixed(1)} ${valueToY(value).toFixed(1)}`)
+    .join(" ");
+}
+
+function instrumentPlotGridSvg(plotW: number, plotH: number, divisions = 10, rows = 8): string {
+  const cols = Array.from({ length: divisions + 1 }, (_, i) => {
+    const x = (i * plotW) / divisions;
+    return `<line x1="${x.toFixed(1)}" y1="0" x2="${x.toFixed(1)}" y2="${plotH}" class="instrument-plot-grid${i === divisions / 2 ? " instrument-plot-grid--center" : ""}"/>`;
+  }).join("");
+  const rowLines = Array.from({ length: rows + 1 }, (_, i) => {
+    const y = (i * plotH) / rows;
+    return `<line x1="0" y1="${y.toFixed(1)}" x2="${plotW}" y2="${y.toFixed(1)}" class="instrument-plot-grid${i === rows / 2 ? " instrument-plot-grid--center" : ""}"/>`;
+  }).join("");
+  return cols + rowLines;
+}
+
+function renderScopePopupPlot(popup: ScopePopupState, history: number[][]): SVGSVGElement {
+  const plotW = 560;
+  const plotH = 280;
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${plotW} ${plotH}`);
+  svg.classList.add("instrument-plot-svg");
+  let markup = `<rect x="0" y="0" width="${plotW}" height="${plotH}" fill="#050505"/>` + instrumentPlotGridSvg(plotW, plotH);
+
+  const channelIndices = popup.activeTab === "all" ? [0, 1, 2, 3] : [popup.activeTab];
+  for (const channel of channelIndices) {
+    const settings = popup.channels[channel];
+    if (!settings || settings.mode === "hide") continue;
+    const fullHistory = history[channel] ?? [];
+    const anchor = settings.mode === "trigger" ? findTriggerAnchorIndex(fullHistory, 2.5) : undefined;
+    const { start, end } = visibleSampleWindow(fullHistory.length, popup.timeDivMs, popup.timePosMs, anchor);
+    const samples = fullHistory.slice(start, end + 1);
+    const voltsPerPx = (settings.voltDiv * 8) / plotH; // 8 divisões verticais
+    const valueToY = (value: number) => plotH / 2 - (value + settings.voltPos) / voltsPerPx;
+    markup += `<path d="${instrumentPlotPolyline(samples, plotW, valueToY)}" fill="none" stroke="${INSTRUMENT_CHANNEL_COLORS[channel]}" stroke-width="2"/>`;
+  }
+  svg.innerHTML = markup;
+  return svg;
+}
+
+function renderLogicPopupPlot(popup: LogicPopupState, history: number[]): SVGSVGElement {
+  const plotW = 700;
+  const plotH = 320;
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${plotW} ${plotH}`);
+  svg.classList.add("instrument-plot-svg");
+  let markup = `<rect x="0" y="0" width="${plotW}" height="${plotH}" fill="#050505"/>` + instrumentPlotGridSvg(plotW, plotH, 10, 8);
+
+  const visibleChannels = INSTRUMENT_CHANNEL_COLORS.map((_, ch) => ch).filter((ch) => !popup.hiddenChannels[ch]);
+  const rowH = plotH / Math.max(1, visibleChannels.length);
+  const anchor = popup.triggerChannel !== "none"
+    ? findTriggerAnchorIndex(history.map((mask) => ((mask >>> (popup.triggerChannel as number)) & 1)), 1)
+    : undefined;
+  const { start, end } = visibleSampleWindow(history.length, popup.timeDivMs, popup.timePosMs, anchor);
+  const samples = history.slice(start, end + 1);
+
+  visibleChannels.forEach((channel, row) => {
+    const rowTop = row * rowH;
+    const high = rowTop + rowH * 0.25;
+    const low = rowTop + rowH * 0.75;
+    const points = samples
+      .map((mask, index) => {
+        const x = (index / Math.max(1, samples.length - 1)) * plotW;
+        const y = ((mask >>> channel) & 1) === 1 ? high : low;
+        return `${index === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
+      })
+      .join(" ");
+    markup += `<path d="${points}" fill="none" stroke="${INSTRUMENT_CHANNEL_COLORS[channel]}" stroke-width="2"/>`;
+  });
+  svg.innerHTML = markup;
+  return svg;
+}
+
+function makeFieldRow(labelText: string, input: HTMLElement): HTMLDivElement {
+  const row = document.createElement("div");
+  row.className = "instrument-field";
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  row.append(label, input);
+  return row;
+}
+
+function makeNumberInput(value: number, step: number, onChange: (value: number) => void): HTMLInputElement {
+  const input = document.createElement("input");
+  input.type = "number";
+  input.value = String(value);
+  input.step = String(step);
+  input.addEventListener("change", () => {
+    const parsed = Number(input.value);
+    if (Number.isFinite(parsed)) onChange(parsed);
+  });
+  return input;
+}
+
+function makeButton(label: string, active: boolean, onClick: () => void): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.className = `instrument-tab${active ? " instrument-tab--active" : ""}`;
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+/** Janela "Expande" arrastável pela barra de título -- mesmo padrão de pointer capture usado em
+ * outros arrastos da Webview, só que fora do `.canvas-content` (não escala/pan com o zoom do
+ * esquemático principal, ver `instrumentPopupLayer`). */
+function makePopupChrome(title: string, popup: InstrumentPopupState): { container: HTMLDivElement; body: HTMLDivElement } {
+  const container = document.createElement("div");
+  container.className = "instrument-popup";
+  container.style.left = `${popup.x}px`;
+  container.style.top = `${popup.y}px`;
+
+  const titlebar = document.createElement("div");
+  titlebar.className = "instrument-popup__titlebar";
+  const titleText = document.createElement("span");
+  titleText.textContent = title;
+  const closeButton = document.createElement("button");
+  closeButton.type = "button";
+  closeButton.className = "instrument-popup__close";
+  closeButton.textContent = "✕";
+  closeButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    closeInstrumentPopup(popup.componentId);
+  });
+  titlebar.append(titleText, closeButton);
+
+  titlebar.addEventListener("pointerdown", (event) => {
+    if (event.target === closeButton) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const originX = popup.x;
+    const originY = popup.y;
+    const onMove = (moveEvent: PointerEvent) => {
+      popup.x = originX + (moveEvent.clientX - startX);
+      popup.y = originY + (moveEvent.clientY - startY);
+      container.style.left = `${popup.x}px`;
+      container.style.top = `${popup.y}px`;
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+  });
+
+  const body = document.createElement("div");
+  body.className = "instrument-popup__body";
+  container.append(titlebar, body);
+  return { container, body };
+}
+
+function buildScopePopup(popup: ScopePopupState, component: WebviewComponentModel): HTMLDivElement {
+  const { container, body } = makePopupChrome(`Oscope-${component.label || component.id}`, popup);
+
+  const plotWrap = document.createElement("div");
+  plotWrap.className = "instrument-popup__plot";
+  plotWrap.appendChild(renderScopePopupPlot(popup, scopeHistoryByComponentId[component.id] ?? [[], [], [], []]));
+
+  const controls = document.createElement("div");
+  controls.className = "instrument-popup__controls";
+
+  const tabs = document.createElement("div");
+  tabs.className = "instrument-tabs";
+  ([0, 1, 2, 3] as const).forEach((channel) => {
+    tabs.appendChild(makeButton(`Ch${channel + 1}`, popup.activeTab === channel, () => {
+      popup.activeTab = channel;
+      renderInstrumentPopups();
+    }));
+  });
+  tabs.appendChild(makeButton("All", popup.activeTab === "all", () => {
+    popup.activeTab = "all";
+    renderInstrumentPopups();
+  }));
+  controls.appendChild(tabs);
+
+  const knobs = document.createElement("div");
+  knobs.className = "instrument-knobs";
+  knobs.appendChild(makeFieldRow("Divisão de Tempo (ms)", makeNumberInput(popup.timeDivMs, 100, (v) => { popup.timeDivMs = Math.max(10, v); renderInstrumentPopups(); })));
+  knobs.appendChild(makeFieldRow("Posição de Tempo (ms)", makeNumberInput(popup.timePosMs, 100, (v) => { popup.timePosMs = v; renderInstrumentPopups(); })));
+  const activeChannelIndex = popup.activeTab === "all" ? 0 : popup.activeTab;
+  const activeChannel = popup.channels[activeChannelIndex];
+  knobs.appendChild(makeFieldRow("Divisão de Tensão (V)", makeNumberInput(activeChannel.voltDiv, 0.1, (v) => { activeChannel.voltDiv = Math.max(0.01, v); renderInstrumentPopups(); })));
+  knobs.appendChild(makeFieldRow("Posição de Tensão (V)", makeNumberInput(activeChannel.voltPos, 0.1, (v) => { activeChannel.voltPos = v; renderInstrumentPopups(); })));
+  controls.appendChild(knobs);
+
+  const channelRows = document.createElement("div");
+  channelRows.className = "instrument-channel-rows";
+  popup.channels.forEach((settings, channel) => {
+    const row = document.createElement("div");
+    row.className = "instrument-channel-row";
+    const swatch = document.createElement("span");
+    swatch.className = "instrument-channel-swatch";
+    swatch.style.background = INSTRUMENT_CHANNEL_COLORS[channel];
+    row.appendChild(swatch);
+    (["auto", "trigger", "hide"] as const).forEach((mode) => {
+      const radioLabel = document.createElement("label");
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = `scope-${component.id}-ch${channel}`;
+      radio.checked = settings.mode === mode;
+      radio.addEventListener("change", () => {
+        settings.mode = mode;
+        renderInstrumentPopups();
+      });
+      radioLabel.append(radio, document.createTextNode(mode === "auto" ? "Auto" : mode === "trigger" ? "Trigger" : "Esconder"));
+      row.appendChild(radioLabel);
+    });
+    channelRows.appendChild(row);
+  });
+  controls.appendChild(channelRows);
+
+  const tracksRow = document.createElement("div");
+  tracksRow.className = "instrument-field";
+  const tracksLabel = document.createElement("label");
+  tracksLabel.textContent = "Trilhas";
+  tracksRow.appendChild(tracksLabel);
+  ([1, 2, 4] as const).forEach((trackCount) => {
+    const radioLabel = document.createElement("label");
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = `scope-${component.id}-tracks`;
+    radio.checked = popup.tracks === trackCount;
+    radio.addEventListener("change", () => {
+      popup.tracks = trackCount;
+      renderInstrumentPopups();
+    });
+    radioLabel.append(radio, document.createTextNode(String(trackCount)));
+    tracksRow.appendChild(radioLabel);
+  });
+  controls.appendChild(tracksRow);
+
+  body.append(plotWrap, controls);
+  return container;
+}
+
+function buildLogicPopup(popup: LogicPopupState, component: WebviewComponentModel): HTMLDivElement {
+  const { container, body } = makePopupChrome(`LAnalizer-${component.label || component.id}`, popup);
+  const history = logicHistoryByComponentId[component.id] ?? [];
+
+  const plotWrap = document.createElement("div");
+  plotWrap.className = "instrument-popup__plot";
+  plotWrap.appendChild(renderLogicPopupPlot(popup, history));
+
+  const controls = document.createElement("div");
+  controls.className = "instrument-popup__controls";
+
+  const knobs = document.createElement("div");
+  knobs.className = "instrument-knobs";
+  knobs.appendChild(makeFieldRow("Divisão de Tempo (ms)", makeNumberInput(popup.timeDivMs, 100, (v) => { popup.timeDivMs = Math.max(10, v); renderInstrumentPopups(); })));
+  knobs.appendChild(makeFieldRow("Posição de Tempo (ms)", makeNumberInput(popup.timePosMs, 100, (v) => { popup.timePosMs = v; renderInstrumentPopups(); })));
+  controls.appendChild(knobs);
+
+  const busLabel = document.createElement("div");
+  busLabel.className = "instrument-section-label";
+  busLabel.textContent = "Barramento";
+  controls.appendChild(busLabel);
+
+  const channelRows = document.createElement("div");
+  channelRows.className = "instrument-channel-rows";
+  popup.hiddenChannels.forEach((hidden, channel) => {
+    const row = document.createElement("div");
+    row.className = "instrument-channel-row";
+    const swatch = document.createElement("span");
+    swatch.className = "instrument-channel-swatch";
+    swatch.style.background = INSTRUMENT_CHANNEL_COLORS[channel];
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = !hidden;
+    checkbox.addEventListener("change", () => {
+      popup.hiddenChannels[channel] = !checkbox.checked;
+      renderInstrumentPopups();
+    });
+    row.append(swatch, checkbox, document.createTextNode(`Ch${channel}`));
+    channelRows.appendChild(row);
+  });
+  controls.appendChild(channelRows);
+
+  const triggerRow = document.createElement("div");
+  triggerRow.className = "instrument-field";
+  const triggerLabel = document.createElement("label");
+  triggerLabel.textContent = "Trigger";
+  const triggerSelect = document.createElement("select");
+  const noneOption = document.createElement("option");
+  noneOption.value = "none";
+  noneOption.textContent = "Nenhum";
+  triggerSelect.appendChild(noneOption);
+  for (let channel = 0; channel < 8; channel++) {
+    const option = document.createElement("option");
+    option.value = String(channel);
+    option.textContent = `Ch${channel}`;
+    triggerSelect.appendChild(option);
+  }
+  triggerSelect.value = popup.triggerChannel === "none" ? "none" : String(popup.triggerChannel);
+  triggerSelect.addEventListener("change", () => {
+    popup.triggerChannel = triggerSelect.value === "none" ? "none" : Number(triggerSelect.value);
+    renderInstrumentPopups();
+  });
+  triggerRow.append(triggerLabel, triggerSelect);
+  controls.appendChild(triggerRow);
+
+  controls.appendChild(makeFieldRow("Limiar ↑ (V)", makeNumberInput(popup.thresholdUp, 0.1, (v) => { popup.thresholdUp = v; renderInstrumentPopups(); })));
+  controls.appendChild(makeFieldRow("Limiar ↓ (V)", makeNumberInput(popup.thresholdDown, 0.1, (v) => { popup.thresholdDown = v; renderInstrumentPopups(); })));
+
+  const exportButton = document.createElement("button");
+  exportButton.type = "button";
+  exportButton.className = "instrument-export-button";
+  exportButton.textContent = "Exportar Dados";
+  exportButton.addEventListener("click", () => exportInstrumentData(component, popup, history));
+  controls.appendChild(exportButton);
+
+  body.append(plotWrap, controls);
+  return container;
+}
+
+/** CSV simples (índice de amostra + 1 coluna por canal visível) -- sem timestamp real de simulação
+ * (só o intervalo de poll de 300ms da Extension, ver `INSTRUMENT_POLL_INTERVAL_MS`); a coluna
+ * "tempo_ms" já deixa isso explícito (aproximado, não o clock interno do circuito) em vez de fingir
+ * precisão que não existe. */
+function exportInstrumentData(component: WebviewComponentModel, popup: InstrumentPopupState, history: number[] | number[][]): void {
+  const lines: string[] = [];
+  if (popup.kind === "logic") {
+    const visibleChannels = popup.hiddenChannels.map((hidden, ch) => (hidden ? -1 : ch)).filter((ch) => ch >= 0);
+    lines.push(["tempo_ms", ...visibleChannels.map((ch) => `ch${ch}`)].join(","));
+    (history as number[]).forEach((mask, index) => {
+      lines.push([index * INSTRUMENT_POLL_INTERVAL_MS, ...visibleChannels.map((ch) => (mask >>> ch) & 1)].join(","));
+    });
+  } else {
+    const matrix = history as number[][];
+    const sampleCount = Math.max(0, ...matrix.map((channel) => channel.length));
+    lines.push(["tempo_ms", "ch0", "ch1", "ch2", "ch3"].join(","));
+    for (let index = 0; index < sampleCount; index++) {
+      lines.push([index * INSTRUMENT_POLL_INTERVAL_MS, ...matrix.map((channel) => channel[index] ?? "")].join(","));
+    }
+  }
+  send({
+    version: WEBVIEW_MESSAGE_VERSION,
+    type: "requestExportInstrumentData",
+    suggestedFileName: `${component.label || component.id}.csv`,
+    csvContent: lines.join("\n"),
+  });
+}
+
+/** Reconstrói TODAS as janelas "Expande" abertas a partir de `instrumentPopups` -- chamado depois
+ * de qualquer mudança de estado relevante (novo readout, abrir/fechar, editar um controle). Sempre
+ * reconstrói do zero (mesmo brute-force de `render()` pro canvas principal) -- volume baixo (no
+ * máximo algumas janelas abertas por vez), não compensa otimizar com diff incremental. */
+function renderInstrumentPopups(): void {
+  instrumentPopupLayer.innerHTML = "";
+  for (const popup of instrumentPopups.values()) {
+    const component = state.components.find((entry) => entry.id === popup.componentId);
+    if (!component) {
+      instrumentPopups.delete(popup.componentId);
+      continue;
+    }
+    const element = popup.kind === "oscope" ? buildScopePopup(popup, component) : buildLogicPopup(popup, component);
+    instrumentPopupLayer.appendChild(element);
+  }
 }
 
 /** `steps`: múltiplo de 90° (1 = CW, -1 = CCW, 2 = 180° — `Ctrl+R`/`Ctrl+Shift+R`/menu "Rotacionar
@@ -1667,9 +2386,16 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
   const el = document.createElement("div");
   const catalogEntry = state.catalog.find((entry) => entry.typeId === component.typeId);
   const box = componentBox(component.typeId, component.properties);
+  const isPushButton = component.typeId === "switches.push";
+  const isSwitchToggle = component.typeId === "switches.switch";
+  const isFixedVolt = component.typeId === "sources.fixed_volt";
+  const isRail = component.typeId === "sources.rail";
+  const isTunnel = component.typeId === "connectors.tunnel";
+  const isMeter = component.typeId.startsWith("meters.") || component.typeId === "instruments.voltmeter";
+  const meterClass = isMeter ? `component--meter component--${component.typeId.replace(/[._]/g, "-")}` : "";
   const isVoltmeter = component.typeId === "instruments.voltmeter"; // só tinge o símbolo, ver styles.css
 
-  el.className = `component ${isComponentSelected(component.id) ? "selected" : ""} ${isVoltmeter ? "component--voltmeter" : ""}`;
+  el.className = `component ${isComponentSelected(component.id) ? "selected" : ""} ${isVoltmeter ? "component--voltmeter" : ""} ${isPushButton ? "component--push" : ""} ${isSwitchToggle ? "component--switch" : ""} ${isFixedVolt ? "component--fixed-volt" : ""} ${isRail ? "component--rail" : ""} ${isTunnel ? "component--tunnel" : ""} ${meterClass}`;
   el.style.left = `${component.x}px`;
   el.style.top = `${component.y}px`;
   el.style.width = `${box.width}px`;
@@ -1685,7 +2411,20 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
   const scaleX = component.flipH ? -1 : 1;
   const scaleY = component.flipV ? -1 : 1;
   svg.style.transform = `rotate(${component.rotation}deg) scale(${scaleX}, ${scaleY})`;
-  svg.innerHTML = packageSymbolSvg(component.typeId, component.properties) ?? catalogEntry?.symbolSvg ?? componentSymbolSvg(component.typeId, component.properties);
+  if (isPushButton) {
+    svg.classList.add("component__symbol--push");
+    if (component.properties.closed === true) svg.classList.add("component__symbol--push-pressed");
+  }
+  if (isSwitchToggle) {
+    svg.classList.add("component__symbol--switch");
+    if (component.properties.closed === true) svg.classList.add("component__symbol--switch-closed");
+  }
+  if (isFixedVolt) {
+    svg.classList.add("component__symbol--fixed-volt");
+    if (component.properties.out === true) svg.classList.add("component__symbol--fixed-volt-on");
+  }
+  const symbolProperties = runtimeSymbolProperties(component);
+  svg.innerHTML = packageSymbolSvg(component.typeId, symbolProperties) ?? catalogEntry?.symbolSvg ?? componentSymbolSvg(component.typeId, symbolProperties);
 
   if (isComponentSelected(component.id)) {
     const overlay = document.createElementNS(SVG_NS, "rect");
@@ -1756,7 +2495,7 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
     el.appendChild(idLabelEl);
   }
 
-  const showValue = component.showValue ?? Boolean(findShowOnSymbolSchema(component));
+  const showValue = usesEmbeddedValueLabel(component.typeId) ? false : component.showValue ?? Boolean(findShowOnSymbolSchema(component));
   if (!component.hidden && showValue) {
     const text = valueLabelText(component);
     if (text !== undefined) {
@@ -1765,6 +2504,69 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
       valueLabelEl.textContent = text;
       el.appendChild(valueLabelEl);
     }
+  }
+
+  if (isPushButton) {
+    el.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || event.shiftKey) return;
+      if (event.target instanceof Element && event.target.closest(".pin-terminal")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (!isComponentSelected(component.id)) selectOnlyComponent(component.id);
+
+      const release = (): void => {
+        window.removeEventListener("pointerup", release);
+        window.removeEventListener("pointercancel", release);
+        window.removeEventListener("blur", release);
+        const refreshedComponent = state.components.find((entry) => entry.id === component.id);
+        if (refreshedComponent) setPushClosed(refreshedComponent, false);
+      };
+
+      window.addEventListener("pointerup", release);
+      window.addEventListener("pointercancel", release);
+      window.addEventListener("blur", release);
+      setPushClosed(component, true);
+    });
+  }
+
+  if (isSwitchToggle) {
+    el.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || event.shiftKey) return;
+      if (event.target instanceof Element && event.target.closest(".pin-terminal")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (!isComponentSelected(component.id)) {
+        selectOnlyComponent(component.id);
+        persistState();
+      }
+      setSwitchClosed(component, component.properties.closed !== true);
+    });
+
+    el.addEventListener("click", (event) => {
+      if (event.target instanceof Element && event.target.closest(".pin-terminal")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, { capture: true });
+  }
+
+  if (isFixedVolt) {
+    el.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || event.shiftKey) return;
+      if (event.target instanceof Element && event.target.closest(".pin-terminal")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (!isComponentSelected(component.id)) {
+        selectOnlyComponent(component.id);
+        persistState();
+      }
+      setFixedVoltOut(component, component.properties.out !== true);
+    });
+
+    el.addEventListener("click", (event) => {
+      if (event.target instanceof Element && event.target.closest(".pin-terminal")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, { capture: true });
   }
 
   el.addEventListener("click", (event) => {
@@ -1792,14 +2594,26 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
     // aparece pra typeId registrado (tem `registeredSourceId` -- built-ins de verdade não têm
     // manifesto nenhum pra editar visualmente).
     const sourceId = catalogEntry?.registeredSourceId;
-    showContextMenu(event, [
-      ...(isGroup ? [] : [{ label: t("properties"), onClick: () => openPropertyDialog(component) }]),
-      { label: t("rotateCw"), onClick: () => rotateSelectedComponents(1) },
-      { label: t("rotateCcw"), onClick: () => rotateSelectedComponents(-1) },
-      { label: t("rotate180"), onClick: () => rotateSelectedComponents(2) },
-      ...(!isGroup && sourceId ? [{ label: t("editSymbol"), onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestEditSymbol", sourceId }) }] : []),
-      { label: isGroup ? t("deleteSelectedItems") : t("delete"), onClick: () => deleteSelectedItems() },
-    ]);
+    const propertyMenuItems: ContextMenuItem[] = isGroup
+      ? []
+      : [{ label: t("properties"), icon: "properties", onClick: () => openPropertyDialog(component) }];
+    const symbolMenuItems: ContextMenuItem[] = !isGroup && sourceId
+      ? [{ label: t("editSymbol"), onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestEditSymbol", sourceId }) }]
+      : [];
+    const menuItems: ContextMenuItem[] = [
+      { label: t("copy"), icon: "copy", shortcut: "Ctrl+C", onClick: () => copySelectedItems() },
+      { label: t("cut"), icon: "cut", shortcut: "Ctrl+X", onClick: () => cutSelectedItems() },
+      { label: isGroup ? t("deleteSelectedItems") : t("remove"), icon: "remove", shortcut: "Del", onClick: () => deleteSelectedItems() },
+      ...propertyMenuItems,
+      { kind: "separator" },
+      { label: t("rotateCw"), icon: "rotateCw", shortcut: "Ctrl+R", onClick: () => rotateSelectedComponents(1) },
+      { label: t("rotateCcw"), icon: "rotateCcw", shortcut: "Ctrl+Shift+R", onClick: () => rotateSelectedComponents(-1) },
+      { label: t("rotate180"), icon: "rotate180", onClick: () => rotateSelectedComponents(2) },
+      { label: t("flipHorizontal"), icon: "flipHorizontal", shortcut: "Ctrl+L", onClick: () => flipSelectedComponents("horizontal") },
+      { label: t("flipVertical"), icon: "flipVertical", shortcut: "Ctrl+Shift+L", onClick: () => flipSelectedComponents("vertical") },
+      ...symbolMenuItems,
+    ];
+    showContextMenu(event, menuItems);
   });
 
   let dragStartX = 0;
@@ -1902,7 +2716,7 @@ function propertyFieldKindFromEditor(editor: string): PropertyFieldKind {
  * typeId) e a telemetria (dinâmica, por instância, via `readoutsByComponentId`). */
 function formatLiveReadout(schema: PropertySchemaEntry, component: WebviewComponentModel): string {
   const unit = schema.unit ? ` ${schema.unit}` : "";
-  const live = readoutsByComponentId[component.id];
+  const live = numericReadout(component);
   if (typeof live === "number") return `${live.toFixed(3)}${unit}`;
   if (simulationStatus === "running") return `...${unit}`;
   return `0.000${unit}`;
@@ -2008,6 +2822,8 @@ function renderPropertyField(component: WebviewComponentModel, field: PropertyFi
     input.addEventListener("change", () => {
       component.properties[field.key] = input.checked;
       send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateProperty", componentId: component.id, name: field.key, value: input.checked });
+      if (component.typeId === "switches.switch" && field.key === "closed") updateRenderedSwitchState(component);
+      if (component.typeId === "sources.fixed_volt" && field.key === "out") updateRenderedFixedVoltState(component);
       persistState();
       refreshOpenPropertyDialog();
     });
@@ -2067,45 +2883,8 @@ function renderPropertyField(component: WebviewComponentModel, field: PropertyFi
   return row;
 }
 
-/** Os 2 checkboxes "de sistema" (mostrar nome/mostrar valor) -- nunca vêm de `propertySchema` do
- * Core (não são propriedade elétrica de typeId nenhum, ver `.spec/lasecsimul.spec` seção 6.1.2);
- * aplicam-se a QUALQUER componente igual, por isso são montados aqui, não em
- * `resolvePropertyFields`/`renderPropertyField`. Mudar um manda os dois valores resolvidos juntos
- * (`requestUpdateLabelVisibility`), nunca toca o Core. */
-function appendSystemVisualFields(fieldset: HTMLElement, component: WebviewComponentModel): void {
-  const currentShowId = component.showId ?? false;
-  const currentShowValue = component.showValue ?? Boolean(findShowOnSymbolSchema(component));
-
-  const sendVisibility = (showId: boolean, showValue: boolean): void => {
-    component.showId = showId;
-    component.showValue = showValue;
-    send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateLabelVisibility", componentId: component.id, showId, showValue });
-    persistState();
-    render();
-    refreshOpenPropertyDialog();
-  };
-
-  const idRow = document.createElement("label");
-  idRow.className = "property-sheet__check-row";
-  const idInput = document.createElement("input");
-  idInput.type = "checkbox";
-  idInput.checked = currentShowId;
-  idInput.addEventListener("change", () => sendVisibility(idInput.checked, currentShowValue));
-  const idText = document.createElement("span");
-  idText.textContent = t("showName");
-  idRow.append(idInput, idText);
-
-  const valueRow = document.createElement("label");
-  valueRow.className = "property-sheet__check-row";
-  const valueInput = document.createElement("input");
-  valueInput.type = "checkbox";
-  valueInput.checked = currentShowValue;
-  valueInput.addEventListener("change", () => sendVisibility(currentShowId, valueInput.checked));
-  const valueText = document.createElement("span");
-  valueText.textContent = t("showValue");
-  valueRow.append(valueInput, valueText);
-
-  fieldset.append(idRow, valueRow);
+function componentTypeLabel(component: WebviewComponentModel): string {
+  return state.catalog.find((entry) => entry.typeId === component.typeId)?.label ?? component.typeId;
 }
 
 function renderPropertySheet(component: WebviewComponentModel): HTMLElement {
@@ -2128,7 +2907,7 @@ function renderPropertySheet(component: WebviewComponentModel): HTMLElement {
   toolbar.className = "property-sheet__toolbar";
   const typeText = document.createElement("div");
   typeText.className = "property-sheet__type";
-  typeText.textContent = `${t("type")}: ${component.label}`;
+  typeText.textContent = `${t("type")}: ${componentTypeLabel(component)}`;
   const toolbarActions = document.createElement("div");
   toolbarActions.className = "property-sheet__actions";
   const helpButton = document.createElement("button");
@@ -2142,9 +2921,13 @@ function renderPropertySheet(component: WebviewComponentModel): HTMLElement {
   showText.textContent = t("show");
   const showCheckbox = document.createElement("input");
   showCheckbox.type = "checkbox";
-  showCheckbox.checked = propertyDialogShowAll;
+  showCheckbox.checked = Boolean(component.showId);
   showCheckbox.addEventListener("change", () => {
-    propertyDialogShowAll = showCheckbox.checked;
+    component.showId = showCheckbox.checked;
+    const showValue = component.showValue ?? Boolean(findShowOnSymbolSchema(component));
+    send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateLabelVisibility", componentId: component.id, showId: component.showId, showValue });
+    persistState();
+    render();
     refreshOpenPropertyDialog();
   });
   showLabel.append(showText, showCheckbox);
@@ -2173,9 +2956,6 @@ function renderPropertySheet(component: WebviewComponentModel): HTMLElement {
   // ordem de inserção) -- nunca prefixado por "Principal", que só faz sentido como fallback da
   // heurística antiga (quando NENHUM grupo real foi declarado).
   const orderedGroupNames = usesSchema ? [...groups.keys()] : [...new Set([t("principal"), ...groups.keys()])];
-  // "Visual" (mostrar nome/valor no canvas) é de sistema -- aplica a QUALQUER typeId, nunca vem do
-  // schema do Core (não é elétrico) -- garante a aba mesmo se nenhuma propriedade real usar esse grupo.
-  if (!orderedGroupNames.includes(t("visual"))) orderedGroupNames.push(t("visual"));
   const tabs = document.createElement("div");
   tabs.className = "property-sheet__tabs";
   const pages = document.createElement("div");
@@ -2188,7 +2968,7 @@ function renderPropertySheet(component: WebviewComponentModel): HTMLElement {
 
     for (const groupName of orderedGroupNames) {
       const fields = groups.get(groupName) ?? [];
-      if (groupName !== t("visual") && fields.length === 0 && !propertyDialogShowAll) continue;
+      if (fields.length === 0 && !propertyDialogShowAll) continue;
       const tab = document.createElement("button");
       tab.type = "button";
       tab.className = `property-sheet__tab${groupName === activeTab ? " property-sheet__tab--active" : ""}`;
@@ -2203,7 +2983,7 @@ function renderPropertySheet(component: WebviewComponentModel): HTMLElement {
     const fieldset = document.createElement("fieldset");
     fieldset.className = "property-sheet__group";
     const fields = groups.get(activeTab) ?? [];
-    if (fields.length === 0 && activeTab !== t("visual")) {
+    if (fields.length === 0) {
       const empty = document.createElement("p");
       empty.className = "property-sheet__empty";
       empty.textContent = t("noProperties");
@@ -2211,7 +2991,6 @@ function renderPropertySheet(component: WebviewComponentModel): HTMLElement {
     } else {
       for (const field of fields) fieldset.appendChild(renderPropertyField(component, field));
     }
-    if (activeTab === t("visual")) appendSystemVisualFields(fieldset, component);
     pages.appendChild(fieldset);
   };
 
@@ -2255,6 +3034,7 @@ window.addEventListener("message", (event: MessageEvent<HostToWebviewMessage>) =
 
   if (message.type === "componentReadout") {
     readoutsByComponentId = message.readoutsByComponentId;
+    updateReadoutHistories(message.readoutsByComponentId);
     render();
     refreshOpenPropertyDialog();
   }
@@ -2266,6 +3046,11 @@ window.addEventListener("message", (event: MessageEvent<HostToWebviewMessage>) =
 
   if (message.type === "simulationStatus") {
     simulationStatus = message.status;
+    if (message.status === "stopped") {
+      readoutsByComponentId = {};
+      scopeHistoryByComponentId = {};
+      logicHistoryByComponentId = {};
+    }
     render();
     refreshOpenPropertyDialog();
   }
@@ -2290,10 +3075,10 @@ function escapeRegExp(value: string): string {
 /** Mesmo algoritmo de `extension.ts::nextIndexedLabel` (duplicado de propósito — são dois pontos de
  * criação de componente independentes, ver `.spec`/plano aprovado). Contador por `typeId`, nunca
  * persistido separado: sempre recalculado a partir de quem já existe em `state.components`. */
-function nextIndexedLabel(typeId: string, baseLabel: string): string {
+function nextIndexedLabel(typeId: string, baseLabel: string, components: WebviewComponentModel[] = state.components): string {
   const pattern = new RegExp(`^${escapeRegExp(baseLabel)}-(\\d+)$`);
   let maxIndex = 0;
-  for (const component of state.components) {
+  for (const component of components) {
     if (component.typeId !== typeId) continue;
     const match = pattern.exec(component.label);
     if (match) maxIndex = Math.max(maxIndex, Number(match[1]));
@@ -2352,7 +3137,7 @@ function makeComponentFromTypeId(typeId: string): WebviewComponentModel {
     typeId,
     label: nextIndexedLabel(typeId, baseLabel),
     hidden: descriptor?.hidden ?? false,
-    showValue: Boolean(descriptor?.propertySchema?.some((schema) => schema.showOnSymbol)),
+    showValue: usesEmbeddedValueLabel(typeId) ? false : Boolean(descriptor?.propertySchema?.some((schema) => schema.showOnSymbol)),
     x: 140 + componentIndex * 24,
     y: 140 + componentIndex * 24,
     rotation: 0,
@@ -2370,7 +3155,7 @@ function refreshReadouts(): void {
     if (!el) continue;
     const existing = el.querySelector<HTMLElement>(".component__value-label");
 
-    const showValue = component.showValue ?? Boolean(findShowOnSymbolSchema(component));
+    const showValue = usesEmbeddedValueLabel(component.typeId) ? false : component.showValue ?? Boolean(findShowOnSymbolSchema(component));
     const text = !component.hidden && showValue ? valueLabelText(component) : undefined;
     if (text === undefined) {
       existing?.remove();
@@ -2382,6 +3167,87 @@ function refreshReadouts(): void {
     valueLabelEl.textContent = text;
     if (!existing) el.appendChild(valueLabelEl);
   }
+}
+
+function pushShortcutKey(component: WebviewComponentModel): string | undefined {
+  if (component.typeId !== "switches.push") return undefined;
+  const raw = component.properties.key;
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return trimmed ? trimmed.toLowerCase() : undefined;
+}
+
+function updateRenderedPushState(component: WebviewComponentModel): void {
+  const elements = document.querySelectorAll(".component");
+  for (let index = 0; index < elements.length; index += 1) {
+    const el = elements.item(index) as HTMLElement;
+    if (el.dataset.componentId !== component.id) continue;
+    const svg = el.querySelector(".component__symbol--push") as SVGSVGElement | null;
+    svg?.classList.toggle("component__symbol--push-pressed", component.properties.closed === true);
+    return;
+  }
+}
+
+function updateRenderedSwitchState(component: WebviewComponentModel): void {
+  const elements = document.querySelectorAll(".component");
+  for (let index = 0; index < elements.length; index += 1) {
+    const el = elements.item(index) as HTMLElement;
+    if (el.dataset.componentId !== component.id) continue;
+    const svg = el.querySelector(".component__symbol--switch") as SVGSVGElement | null;
+    svg?.classList.toggle("component__symbol--switch-closed", component.properties.closed === true);
+    return;
+  }
+}
+
+function updateRenderedFixedVoltState(component: WebviewComponentModel): void {
+  const elements = document.querySelectorAll(".component");
+  for (let index = 0; index < elements.length; index += 1) {
+    const el = elements.item(index) as HTMLElement;
+    if (el.dataset.componentId !== component.id) continue;
+    const svg = el.querySelector(".component__symbol--fixed-volt") as SVGSVGElement | null;
+    svg?.classList.toggle("component__symbol--fixed-volt-on", component.properties.out === true);
+    return;
+  }
+}
+
+function setPushClosed(component: WebviewComponentModel, closed: boolean): void {
+  if (component.properties.closed === closed) return;
+  component.properties.closed = closed;
+  send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateProperty", componentId: component.id, name: "closed", value: closed });
+  vscode?.setState(state);
+  updateRenderedPushState(component);
+  refreshOpenPropertyDialog();
+}
+
+function setSwitchClosed(component: WebviewComponentModel, closed: boolean): void {
+  if (component.properties.closed === closed) return;
+  component.properties.closed = closed;
+  send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateProperty", componentId: component.id, name: "closed", value: closed });
+  vscode?.setState(state);
+  updateRenderedSwitchState(component);
+  refreshOpenPropertyDialog();
+}
+
+function setFixedVoltOut(component: WebviewComponentModel, out: boolean): void {
+  if (component.properties.out === out) return;
+  component.properties.out = out;
+  send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateProperty", componentId: component.id, name: "out", value: out });
+  vscode?.setState(state);
+  updateRenderedFixedVoltState(component);
+  refreshOpenPropertyDialog();
+}
+
+function handlePushShortcut(event: KeyboardEvent, closed: boolean): boolean {
+  const key = event.key.toLowerCase();
+  let handled = false;
+  for (const component of state.components) {
+    if (pushShortcutKey(component) !== key) continue;
+    if (closed) activePushShortcutIds.add(component.id);
+    else if (!activePushShortcutIds.delete(component.id)) continue;
+    setPushClosed(component, closed);
+    handled = true;
+  }
+  return handled;
 }
 
 function renderJunction(component: WebviewComponentModel): HTMLElement {
@@ -2419,6 +3285,30 @@ window.addEventListener("keydown", (event) => {
     return;
   }
 
+  if (ctrl && event.key.toLowerCase() === "c") {
+    event.preventDefault();
+    copySelectedItems();
+    return;
+  }
+
+  if (ctrl && event.key.toLowerCase() === "x") {
+    event.preventDefault();
+    cutSelectedItems();
+    return;
+  }
+
+  if (ctrl && event.key.toLowerCase() === "v") {
+    event.preventDefault();
+    pasteClipboardItems();
+    return;
+  }
+
+  if (ctrl && event.key.toLowerCase() === "l") {
+    event.preventDefault();
+    flipSelectedComponents(event.shiftKey ? "vertical" : "horizontal");
+    return;
+  }
+
   if (event.key === "Delete" || event.key === "Backspace") {
     if (state.selectedWireIds.length > 0 || state.selectedComponentIds.length > 0) {
       deleteSelectedItems();
@@ -2443,6 +3333,11 @@ window.addEventListener("keydown", (event) => {
     return;
   }
 
+  if (!ctrl && !event.altKey && !event.repeat && handlePushShortcut(event, true)) {
+    event.preventDefault();
+    return;
+  }
+
   // Atalho solto `r` (sem Ctrl) -- herdado de quando a seleção era singular, rotaciona só o
   // primeiro componente selecionado (não o grupo inteiro -- isso é o que `Ctrl+R` faz agora).
   if (!ctrl && event.key.toLowerCase() === "r" && getSelectedComponent()) {
@@ -2459,6 +3354,13 @@ window.addEventListener("keydown", (event) => {
     persistState();
     render();
   }
+});
+
+window.addEventListener("keyup", (event) => {
+  if (document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLTextAreaElement) {
+    return;
+  }
+  if (handlePushShortcut(event, false)) event.preventDefault();
 });
 
 render();

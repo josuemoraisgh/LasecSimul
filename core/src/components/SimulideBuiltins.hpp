@@ -184,8 +184,10 @@ private:
 
 class SimulideSwitch final : public IComponentModel {
 public:
-    SimulideSwitch(std::string typeId, std::vector<Pin> pins, bool closed, bool normallyClosed = false)
-        : m_typeId(std::move(typeId)), m_pins(std::move(pins)), m_closed(closed), m_normallyClosed(normallyClosed) {}
+    SimulideSwitch(std::string typeId, std::vector<Pin> pins, bool closed, bool normallyClosed = false,
+                   bool doubleThrow = false, double poles = 1.0, std::string key = {})
+        : m_typeId(std::move(typeId)), m_pins(std::move(pins)), m_closed(closed), m_normallyClosed(normallyClosed),
+          m_doubleThrow(doubleThrow), m_poles(detail::clampMin(poles, 1.0)), m_key(std::move(key)) {}
 
     const char* typeId() const override { return m_typeId.c_str(); }
     std::span<Pin> pins() override { return m_pins; }
@@ -204,6 +206,14 @@ public:
     void setState(const uint8_t*, size_t) override {}
 
     std::vector<PropertyDescriptor> propertyDescriptors() override {
+        if (m_typeId == "switches.push") {
+            auto schemas = pushPropertySchema();
+            return {detail::boolDescriptor("closed", schemas[0], m_closed),
+                    detail::boolDescriptor("normallyClosed", schemas[1], m_normallyClosed),
+                    detail::boolDescriptor("doubleThrow", schemas[2], m_doubleThrow),
+                    detail::numberDescriptor("poles", schemas[3], m_poles, 1.0),
+                    detail::textDescriptor("key", schemas[4], m_key)};
+        }
         auto schemas = propertySchema();
         return {detail::boolDescriptor("closed", schemas[0], m_closed),
                 detail::boolDescriptor("normallyClosed", schemas[1], m_normallyClosed)};
@@ -214,11 +224,26 @@ public:
                 detail::boolSchema("normallyClosed", "Normalmente Fechado", false)};
     }
 
+    static std::vector<PropertySchema> pushPropertySchema() {
+        auto schemas = std::vector<PropertySchema>{
+            detail::boolSchema("closed", "Fechado", false, PropertySchemaHidden),
+            detail::boolSchema("normallyClosed", "Normalmente Fechado", false),
+            detail::boolSchema("doubleThrow", "Double Throw", false, PropertySchemaAffectsTopology),
+            detail::numberSchema("poles", "Polos", "", 1.0, 1.0, 1.0, PropertySchemaAffectsTopology),
+            detail::textSchema("key", "Tecla", ""),
+        };
+        for (PropertySchema& schema : schemas) schema.group = "Principal";
+        return schemas;
+    }
+
 private:
     std::string m_typeId;
     std::vector<Pin> m_pins;
     bool m_closed;
     bool m_normallyClosed;
+    bool m_doubleThrow;
+    double m_poles;
+    std::string m_key;
 };
 
 class SimulideRelay final : public IComponentModel {

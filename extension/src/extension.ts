@@ -9,7 +9,7 @@ import { isPreApproved, isPreBlocked, resolveConsentChoice, shouldLoadLibrary, d
 import { SchematicPanel } from "./ui/panels/SchematicPanel";
 import { createInitialWebviewState } from "./ui/webview/catalog";
 import { PackageDescriptor, PackagePin, PackageShape, PropertySchemaEntry, WebviewComponentCatalogEntry, WebviewComponentModel, WebviewProjectState, WebviewWireModel } from "./ui/webview/model";
-import { SimulationStatus, WebviewToHostMessage } from "./ui/webview/messages";
+import { ComponentReadoutValue, SimulationStatus, WebviewToHostMessage } from "./ui/webview/messages";
 import { ComponentPaletteViewProvider } from "./ui/views/ComponentPaletteViewProvider";
 import { ProjectSerializer } from "./project/ProjectSerializer";
 import { ProjectComponent, ProjectDocument, createEmptyProject } from "./project/ProjectTypes";
@@ -621,21 +621,52 @@ function pushRemoveToCore(componentId: string): void {
 
 let voltageReadoutTimer: ReturnType<typeof setInterval> | undefined;
 
+function decodeComponentReadout(typeId: string, state: Buffer): ComponentReadoutValue | undefined {
+  if (
+    typeId === "instruments.voltmeter" ||
+    typeId === "meters.probe" ||
+    typeId === "meters.ampmeter" ||
+    typeId === "meters.freqmeter"
+  ) {
+    return state.length >= 8 ? state.readDoubleLE(0) : undefined;
+  }
+  if (typeId === "meters.oscope") {
+    if (state.length < 32) return undefined;
+    return [0, 1, 2, 3].map((channel) => state.readDoubleLE(channel * 8));
+  }
+  if (typeId === "meters.logic_analyzer") {
+    return state.length >= 4 ? state.readUInt32LE(0) : undefined;
+  }
+  return undefined;
+}
+
+function isReadableInstrument(typeId: string): boolean {
+  return (
+    typeId === "instruments.voltmeter" ||
+    typeId === "meters.probe" ||
+    typeId === "meters.ampmeter" ||
+    typeId === "meters.freqmeter" ||
+    typeId === "meters.oscope" ||
+    typeId === "meters.logic_analyzer"
+  );
+}
+
 /** Lê o estado de cada "instruments.voltmeter" no projeto e manda pra Webview — único instrumento
  * com leitura via Webview hoje (ver .spec/lasecsimul.spec sobre instrumentos como plugin ABI).
  * Generaliza naturalmente pra outros: basta interpretar getComponentState() conforme o typeId. */
 async function pollInstrumentReadouts(): Promise<void> {
   if (!coreClient || !schematicPanel) return;
-  const voltmeters = schematicState.components.filter((component) => component.typeId === "instruments.voltmeter");
-  if (voltmeters.length === 0) return;
+  const instruments = schematicState.components.filter((component) => isReadableInstrument(component.typeId));
+  if (instruments.length === 0) return;
 
-  const readoutsByComponentId: Record<string, number> = {};
-  for (const component of voltmeters) {
+  const readoutsByComponentId: Record<string, ComponentReadoutValue> = {};
+  for (const component of instruments) {
     const coreId = coreInstanceIdByComponentId.get(component.id);
     if (!coreId) continue;
     try {
       const state = await coreClient.getComponentState(coreId);
-      if (state.length >= 8) readoutsByComponentId[component.id] = state.readDoubleLE(0);
+      const readout = decodeComponentReadout(component.typeId, state);
+      if (readout !== undefined) readoutsByComponentId[component.id] = readout;
     } catch {
       // instância ainda não assentou ou foi removida nesse meio tempo -- ignora neste tick, tenta de novo no próximo
     }
@@ -682,6 +713,7 @@ function stopVoltageReadoutPolling(): void {
   // Sem simulação rodando não há tensão "atual" pra mostrar -- volta os fios pra cor neutra em vez
   // de deixar a última cor (vermelho/azul) congelada, o que pareceria que ainda está simulando.
   schematicPanel?.postMessage({ version: 1, type: "wireVoltages", voltagesByWireId: {} });
+  schematicPanel?.postMessage({ version: 1, type: "componentReadout", readoutsByComponentId: {} });
 }
 
 /** Mesma geração de ids de pino que `projectToWebviewState`/a Webview usam ("pin-1".."pin-N", a
@@ -739,6 +771,37 @@ function pinsForTypeId(typeId: string): Array<{ id: string; x: number; y: number
     return descriptor.pinIds.map((id, index) => ({ id, x: 0, y: index * 12 }));
   }
   return Array.from({ length: pinCount }, (_, index) => ({ id: `pin-${index + 1}`, x: 0, y: index * 12 }));
+}
+
+/** `pinsForTypeId` cai pro numerador genérico (`pin-1`/`pin-2`...) quando o catálogo não tem
+ * `pinIds` -- builtins sem `package` próprio (resistor, tunnel, ground, fonte fixa, switch). Isso
+ * está OK pra fios criados pela própria UI (ela usa o id que `pinsForTypeId` deu na criação, sem
+ * mismatch), mas quebra pra fios que já existem no disco com o id elétrico REAL do Core (`p1`/`p2`
+ * de `passive.resistor`, `pin` de `connectors.tunnel`, `out` de `sources.fixed_volt` -- ver
+ * `CoreApplication.cpp::registerBuiltinComponents`) -- exatamente o caso de `.lssub.json::wires[]`
+ * de um subcircuito, escrito direto com esses ids. Sem essa correspondência, `pinScenePosition`
+ * (main.ts) nunca acha o pino certo no componente seedado e a wire some da tela (raiz do "não tem
+ * linha nenhuma" reportado ao abrir um subcircuito pra editar). Substitui cada id genérico pelo id
+ * real encontrado em QUALQUER wire que toque este componente, na MESMA posição/índice (geometria
+ * de `pinLocalPosition` é por índice pra typeIds sem `package`, então a troca de string não move
+ * nada na tela -- só agora bate com o que a wire espera); típeIds COM `package` (ex:
+ * `espressif.esp32`) já vinham com o id real certo de `pinsForTypeId`, então o id "real" encontrado
+ * aqui é sempre redundante/igual pra eles, nunca pior. */
+function pinsForInternalComponent(componentId: string, typeId: string, wires: InternalWireSeed[]): Array<{ id: string; x: number; y: number }> {
+  const generic = pinsForTypeId(typeId);
+  const realIds: string[] = [];
+  for (const wire of wires) {
+    if (wire.from.componentId === componentId && wire.from.pinId && !realIds.includes(wire.from.pinId)) realIds.push(wire.from.pinId);
+    if (wire.to.componentId === componentId && wire.to.pinId && !realIds.includes(wire.to.pinId)) realIds.push(wire.to.pinId);
+  }
+  if (realIds.length === 0) return generic;
+
+  const count = Math.max(generic.length, realIds.length);
+  return Array.from({ length: count }, (_, index) => ({
+    id: realIds[index] ?? generic[index]?.id ?? `pin-${index + 1}`,
+    x: 0,
+    y: index * 12,
+  }));
 }
 
 function shouldSyncComponentToCore(typeId: string): boolean {
@@ -976,6 +1039,29 @@ function handleWebviewMessage(message: WebviewToHostMessage): void {
       syncSchematicPanel();
       return;
     }
+    case "requestInsertItems": {
+      const existingComponentIds = new Set(schematicState.components.map((component) => component.id));
+      const existingWireIds = new Set(schematicState.wires.map((wire) => wire.id));
+      const components = message.components.filter((component) => !existingComponentIds.has(component.id));
+      const insertedComponentIds = new Set(components.map((component) => component.id));
+      const wires = message.wires.filter((wire) =>
+        !existingWireIds.has(wire.id) &&
+        (existingComponentIds.has(wire.from.componentId) || insertedComponentIds.has(wire.from.componentId)) &&
+        (existingComponentIds.has(wire.to.componentId) || insertedComponentIds.has(wire.to.componentId))
+      );
+
+      schematicState = {
+        ...schematicState,
+        components: [...schematicState.components, ...components],
+        wires: [...schematicState.wires, ...wires],
+        selectedComponentIds: components.map((component) => component.id),
+        selectedWireIds: wires.map((wire) => wire.id),
+      };
+      for (const component of components) pushComponentToCore(component.id, component.typeId, component.properties, component.pins);
+      for (const wire of wires) pushWireToCore(wire);
+      syncSchematicPanel();
+      return;
+    }
     case "requestRemoveComponent": {
       pushRemoveToCore(message.componentId);
       coreInstanceIdByComponentId.delete(message.componentId);
@@ -1162,6 +1248,25 @@ function handleWebviewMessage(message: WebviewToHostMessage): void {
     case "requestSwitchSymbolView":
       void switchSymbolViewCommand(message.filePath, message.typeId, message.kind, message.toView, message.internalComponents, message.internalWires);
       return;
+    case "requestExportInstrumentData":
+      void exportInstrumentDataCommand(message.suggestedFileName, message.csvContent);
+      return;
+  }
+}
+
+/** "Exportar Dados" da janela "Expande" (osciloscópio/analisador lógico) -- o CSV já vem formatado
+ * da Webview (main.ts, que tem o histórico/configuração de canais); aqui só o diálogo de salvar +
+ * escrita do arquivo, igual a `saveProjectCommand`. */
+async function exportInstrumentDataCommand(suggestedFileName: string, csvContent: string): Promise<void> {
+  const uri = await vscode.window.showSaveDialog({
+    filters: { "CSV": ["csv"] },
+    defaultUri: vscode.Uri.file(suggestedFileName),
+  });
+  if (!uri) return;
+  try {
+    fs.writeFileSync(uri.fsPath, csvContent, "utf8");
+  } catch (err) {
+    vscode.window.showErrorMessage(`Não foi possível exportar os dados: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -1624,7 +1729,10 @@ async function editPackageSymbolCommand(item?: { sourceId?: string; view?: "defa
   if (kind === "subcircuit-file") {
     const internal = extractInternalCircuit(json);
     const seededInternal = seedSubcircuitInternalComponents(internal.components, internal.wires);
-    const componentsWithPins = seededInternal.components.map((component) => ({ ...component, pins: pinsForTypeId(component.typeId) }));
+    const componentsWithPins = seededInternal.components.map((component) => ({
+      ...component,
+      pins: pinsForInternalComponent(component.id, component.typeId, internal.wires),
+    }));
     components = [...components, ...componentsWithPins];
     wires = seededInternal.wires;
   }

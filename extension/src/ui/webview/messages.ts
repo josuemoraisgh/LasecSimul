@@ -9,13 +9,14 @@ export type SymbolAuthoringKind = "abi-device" | "mcu-adapter" | "subcircuit-fil
 export const WEBVIEW_MESSAGE_VERSION = 1 as const;
 
 export type SimulationStatus = "stopped" | "running" | "paused";
+export type ComponentReadoutValue = number | number[];
 
 export type HostToWebviewMessage =
   | { version: number; type: "init"; project: WebviewProjectState }
   | { version: number; type: "selectComponent"; componentId: string | null }
   | { version: number; type: "requestAddComponent"; typeId: string }
   | { version: number; type: "syncState"; project: WebviewProjectState }
-  | { version: number; type: "componentReadout"; readoutsByComponentId: Record<string, number> }
+  | { version: number; type: "componentReadout"; readoutsByComponentId: Record<string, ComponentReadoutValue> }
   | { version: number; type: "wireVoltages"; voltagesByWireId: Record<string, number> }
   | { version: number; type: "simulationStatus"; status: SimulationStatus }
   /** Vem de `lasecsimul.rotateSelectionCw`/`Ccw` (`extension.ts`), disparado por keybinding do
@@ -55,6 +56,7 @@ export type WebviewToHostMessage =
   | { version: number; type: "webviewReady" }
   | { version: number; type: "projectChanged"; project: WebviewProjectState }
   | { version: number; type: "requestAddComponent"; typeId: string }
+  | { version: number; type: "requestInsertItems"; components: WebviewComponentModel[]; wires: WebviewWireModel[] }
   | { version: number; type: "requestRemoveComponent"; componentId: string }
   | { version: number; type: "requestRemoveWire"; wireId: string }
   | { version: number; type: "requestRotateComponent"; componentId: string; rotation: 0 | 90 | 180 | 270 }
@@ -104,7 +106,11 @@ export type WebviewToHostMessage =
       toView: "default" | "logicSymbol";
       internalComponents: WebviewComponentModel[];
       internalWires: WebviewWireModel[];
-    };
+    }
+  /** "Exportar Dados" da janela "Expande" do osciloscópio/analisador lógico -- o CSV já vem PRONTO
+   * (formatado em main.ts, que é quem tem o histórico/configuração de canais) pra extension.ts só
+   * abrir `showSaveDialog`/escrever o arquivo, sem precisar conhecer o formato do instrumento. */
+  | { version: number; type: "requestExportInstrumentData"; suggestedFileName: string; csvContent: string };
 
 export function isHostMessage(value: unknown): value is HostToWebviewMessage {
   return typeof value === "object" && value !== null && "type" in value && "version" in value;
