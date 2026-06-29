@@ -11,6 +11,20 @@ export const WEBVIEW_MESSAGE_VERSION = 1 as const;
 export type SimulationStatus = "stopped" | "running" | "paused";
 export type ComponentReadoutValue = number | number[];
 
+/** Histórico REAL (tempo simulado de verdade, `Scheduler::nowNs()` do Core -- ver `core/src/
+ * components/meters/Oscope.hpp`/`LogicAnalyzer.hpp`) pra janela "Expande" -- diferente do
+ * `ComponentReadoutValue` acima, que só carrega a ÚLTIMA leitura (usado pela pré-visualização
+ * pequena no canvas, que acumula seu PRÓPRIO histórico no cliente por poll de IPC, sem precisão de
+ * tempo real -- ver `main.ts::updateReadoutHistories`). Buscado só quando uma janela "Expande" está
+ * aberta pra aquele componente (`requestInstrumentHistory`), não a cada poll de TODOS os
+ * instrumentos -- histórico real pode ter centenas de amostras, não compensa mandar pra quem não
+ * pediu. */
+export interface InstrumentHistoryPayload {
+  componentId: string;
+  oscope?: { channels: Array<{ timestampsNs: number[]; values: number[] }> };
+  logic?: { timestampsNs: number[]; masks: number[] };
+}
+
 export type HostToWebviewMessage =
   | { version: number; type: "init"; project: WebviewProjectState }
   | { version: number; type: "selectComponent"; componentId: string | null }
@@ -19,6 +33,9 @@ export type HostToWebviewMessage =
   | { version: number; type: "componentReadout"; readoutsByComponentId: Record<string, ComponentReadoutValue> }
   | { version: number; type: "wireVoltages"; voltagesByWireId: Record<string, number> }
   | { version: number; type: "simulationStatus"; status: SimulationStatus }
+  /** Resposta a `requestInstrumentHistory` -- histórico REAL (tempo simulado), ver
+   * `InstrumentHistoryPayload`. */
+  | ({ version: number; type: "instrumentHistory" } & InstrumentHistoryPayload)
   /** Vem de `lasecsimul.rotateSelectionCw`/`Ccw` (`extension.ts`), disparado por keybinding do
    * VSCode com `when: activeWebviewPanelId == 'lasecsimul.schematic'` -- sobrepõe o `Ctrl+R`/
    * `Ctrl+Shift+R` nativo do VSCode SÓ enquanto o painel está em foco (`when` reverte sozinho ao
@@ -110,7 +127,11 @@ export type WebviewToHostMessage =
   /** "Exportar Dados" da janela "Expande" do osciloscópio/analisador lógico -- o CSV já vem PRONTO
    * (formatado em main.ts, que é quem tem o histórico/configuração de canais) pra extension.ts só
    * abrir `showSaveDialog`/escrever o arquivo, sem precisar conhecer o formato do instrumento. */
-  | { version: number; type: "requestExportInstrumentData"; suggestedFileName: string; csvContent: string };
+  | { version: number; type: "requestExportInstrumentData"; suggestedFileName: string; csvContent: string }
+  /** Pedido de histórico REAL pra janela "Expande" -- ver `InstrumentHistoryPayload`. Mandado ao
+   * abrir a janela e a cada `componentReadout` enquanto ela continuar aberta (mesmo ritmo de
+   * atualização do resto da telemetria, ~300ms, ver `pollInstrumentReadouts`). */
+  | { version: number; type: "requestInstrumentHistory"; componentId: string };
 
 export function isHostMessage(value: unknown): value is HostToWebviewMessage {
   return typeof value === "object" && value !== null && "type" in value && "version" in value;

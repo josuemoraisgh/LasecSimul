@@ -168,15 +168,24 @@ function t(key: keyof typeof UI_TEXT["pt-BR"]): string {
 }
 
 let readoutsByComponentId: Record<string, ComponentReadoutValue> = {};
+// Histórico APROXIMADO (1 amostra por poll de IPC, ~300ms de parede, sem relação com o tempo
+// SIMULADO do circuito) -- só pra pré-visualização PEQUENA no canvas (`scopePanelSvg`/
+// `logicAnalyzerPanelSvg`), onde não compensa buscar o histórico real de alta resolução pra todo
+// instrumento do projeto a cada poll. A janela "Expande" usa `realScopeHistoryByComponentId`/
+// `realLogicHistoryByComponentId` abaixo (tempo SIMULADO de verdade, ver `requestInstrumentHistory`).
 let scopeHistoryByComponentId: Record<string, number[][]> = {};
 let logicHistoryByComponentId: Record<string, number[]> = {};
-// `pollInstrumentReadouts` (extension.ts) tira uma amostra a cada 300ms (setInterval real) -- é a
-// ÚNICA base de tempo real que temos pra eixo X da janela "Expande" (osciloscópio/analisador não
-// têm buffer de alta frequência no Core, só o estado mais recente por amostra de leitura, ver
-// `core/src/components/meters/Oscope.hpp`). Aumentado de 96 pra 600 amostras (~3min de histórico)
-// pra dar faixa de zoom (Divisão de Tempo) razoável na janela expandida.
 const INSTRUMENT_POLL_INTERVAL_MS = 300;
 const INSTRUMENT_HISTORY_DEPTH = 600;
+
+// Histórico REAL (tempo simulado de verdade, `Scheduler::nowNs()` do Core -- ver `core/src/
+// components/meters/Oscope.hpp`/`LogicAnalyzer.hpp`) -- buscado via `requestInstrumentHistory` só
+// pros componentes com janela "Expande" ABERTA (ver `toggleInstrumentPopup`/`updateReadoutHistories`),
+// nunca pra todo instrumento do projeto (histórico real pode ter centenas de amostras, desperdício
+// pra quem não abriu a janela). Resolve a limitação documentada antes desta data: o eixo de tempo
+// da janela "Expande" agora é de verdade, não uma aproximação sobre o intervalo de poll de IPC.
+const realScopeHistoryByComponentId = new Map<string, Array<{ timestampsNs: number[]; values: number[] }>>();
+const realLogicHistoryByComponentId = new Map<string, { timestampsNs: number[]; masks: number[] }>();
 let voltagesByWireId: Record<string, number> = {};
 let pendingWirePreviewTarget: Point | undefined;
 let pendingWireRoute: Point[] = [];
@@ -1842,6 +1851,9 @@ function updateReadoutHistories(readouts: Record<string, ComponentReadoutValue>)
   }
   scopeHistoryByComponentId = scopeHistories;
   logicHistoryByComponentId = logicHistories;
+  // Mesmo ritmo do poll de telemetria pequena (~300ms) -- só pros componentes com janela "Expande"
+  // aberta agora, ver doc de `realScopeHistoryByComponentId` acima.
+  for (const componentId of instrumentPopups.keys()) requestInstrumentHistoryRefresh(componentId);
   renderInstrumentPopups();
 }
 
@@ -1868,6 +1880,7 @@ interface ScopePopupState {
   timePosMs: number;
   tracks: 1 | 2 | 4;
   channels: ScopeChannelSettings[];
+  triggerLevel: number;
 }
 
 interface LogicPopupState {
@@ -1903,6 +1916,7 @@ function defaultScopePopupState(componentId: string, x: number, y: number): Scop
     timePosMs: 0,
     tracks: 4,
     channels: [0, 1, 2, 3].map(() => ({ mode: "auto", voltDiv: 1, voltPos: 0 })),
+    triggerLevel: 0,
   };
 }
 
@@ -1921,9 +1935,15 @@ function defaultLogicPopupState(componentId: string, x: number, y: number): Logi
   };
 }
 
+function requestInstrumentHistoryRefresh(componentId: string): void {
+  send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestInstrumentHistory", componentId });
+}
+
 function toggleInstrumentPopup(component: WebviewComponentModel): void {
   if (instrumentPopups.has(component.id)) {
     instrumentPopups.delete(component.id);
+    realScopeHistoryByComponentId.delete(component.id);
+    realLogicHistoryByComponentId.delete(component.id);
   } else {
     const cascadeOffset = (instrumentPopups.size % 6) * 28;
     if (component.typeId === "meters.oscope") {
@@ -1931,6 +1951,7 @@ function toggleInstrumentPopup(component: WebviewComponentModel): void {
     } else if (component.typeId === "meters.logic_analyzer") {
       instrumentPopups.set(component.id, defaultLogicPopupState(component.id, 90 + cascadeOffset, 90 + cascadeOffset));
     }
+    requestInstrumentHistoryRefresh(component.id);
   }
   renderInstrumentPopups();
 }
@@ -1947,27 +1968,55 @@ function closeInstrumentPopup(componentId: string): void {
  * disponível ainda (cai pro alinhamento "auto", ancorado no fim do buffer). */
 function findTriggerAnchorIndex(history: number[], thresholdUp: number): number | undefined {
   for (let i = history.length - 1; i > 0; i--) {
-    if (history[i - 1] < thresholdUp && history[i] >= thresholdUp) return i;
+    const previous = history[i - 1];
+    const current = history[i];
+    if (previous !== undefined && current !== undefined && previous < thresholdUp && current >= thresholdUp) return i;
   }
   return undefined;
 }
 
-/** Janela de amostras visível no plot, a partir de Divisão/Posição de Tempo (ambos em "ms", mas a
- * única base de tempo real disponível é o intervalo de poll de 300ms -- ver comentário em
- * `INSTRUMENT_POLL_INTERVAL_MS`). `anchorIndex` (índice absoluto na história completa) centraliza
- * a janela ali em vez de ancorar no fim -- usado pelo modo "trigger". */
-function visibleSampleWindow(historyLength: number, timeDivMs: number, timePosMs: number, anchorIndex?: number, divisions = 10): { start: number; end: number } {
-  const samplesPerDiv = Math.max(1, Math.round(timeDivMs / INSTRUMENT_POLL_INTERVAL_MS));
-  const windowSize = Math.max(2, samplesPerDiv * divisions);
-  const posSamples = Math.round(timePosMs / INSTRUMENT_POLL_INTERVAL_MS);
+/** Janela de amostras visível no plot, a partir de Divisão/Posição de Tempo (ambos em "ms") e dos
+ * timestamps REAIS (tempo simulado, ns) de cada amostra -- nunca assume espaçamento uniforme (a
+ * frequência de gravação no Core é por TEMPO decorrido, não por contagem de amostra, ver doc de
+ * `Oscope.hpp`). `anchorIndex` (índice absoluto na história completa) centraliza a janela ali em
+ * vez de ancorar no fim -- usado pelo modo "trigger". */
+function visibleSampleWindow(timestampsNs: number[], timeDivMs: number, timePosMs: number, anchorIndex?: number, divisions = 10): { start: number; end: number } {
+  if (timestampsNs.length === 0) return { start: 0, end: -1 };
+  const windowNs = timeDivMs * 1e6 * divisions;
+  const posNs = timePosMs * 1e6;
   if (anchorIndex !== undefined) {
-    const center = anchorIndex + posSamples;
-    const start = Math.max(0, center - Math.floor(windowSize / 2));
-    return { start, end: Math.min(historyLength - 1, start + windowSize - 1) };
+    const centerNs = timestampsNs[anchorIndex]! + posNs;
+    let start = anchorIndex;
+    while (start > 0 && timestampsNs[start - 1]! >= centerNs - windowNs / 2) start--;
+    let end = anchorIndex;
+    while (end < timestampsNs.length - 1 && timestampsNs[end + 1]! <= centerNs + windowNs / 2) end++;
+    return { start, end };
   }
-  const end = Math.max(0, historyLength - 1 - posSamples);
-  const start = Math.max(0, end - windowSize + 1);
+  const lastNs = timestampsNs[timestampsNs.length - 1]! - posNs;
+  let end = timestampsNs.length - 1;
+  while (end > 0 && timestampsNs[end]! > lastNs) end--;
+  let start = end;
+  while (start > 0 && timestampsNs[start - 1]! >= lastNs - windowNs) start--;
   return { start, end };
+}
+
+/** Adapta o histórico de um componente pro formato unificado `{timestampsNs, values}` por canal --
+ * prefere o histórico REAL (`realScopeHistoryByComponentId`, ver doc lá); se ainda não chegou
+ * nenhuma resposta de `requestInstrumentHistory` (popup recém-aberto), cai no histórico
+ * APROXIMADO de sempre, sintetizando timestamps no intervalo de poll (só pra não desenhar um plot
+ * vazio no primeiro frame). */
+function scopeChannelsFor(componentId: string): Array<{ timestampsNs: number[]; values: number[] }> {
+  const real = realScopeHistoryByComponentId.get(componentId);
+  if (real) return real;
+  const approx = scopeHistoryByComponentId[componentId] ?? [[], [], [], []];
+  return approx.map((values) => ({ values, timestampsNs: values.map((_, i) => i * INSTRUMENT_POLL_INTERVAL_MS * 1e6) }));
+}
+
+function logicChannelFor(componentId: string): { timestampsNs: number[]; masks: number[] } {
+  const real = realLogicHistoryByComponentId.get(componentId);
+  if (real) return real;
+  const approx = logicHistoryByComponentId[componentId] ?? [];
+  return { masks: approx, timestampsNs: approx.map((_, i) => i * INSTRUMENT_POLL_INTERVAL_MS * 1e6) };
 }
 
 function instrumentPlotPolyline(samples: number[], plotW: number, valueToY: (value: number) => number): string {
@@ -1989,7 +2038,7 @@ function instrumentPlotGridSvg(plotW: number, plotH: number, divisions = 10, row
   return cols + rowLines;
 }
 
-function renderScopePopupPlot(popup: ScopePopupState, history: number[][]): SVGSVGElement {
+function renderScopePopupPlot(popup: ScopePopupState, channels: Array<{ timestampsNs: number[]; values: number[] }>): SVGSVGElement {
   const plotW = 560;
   const plotH = 280;
   const svg = document.createElementNS(SVG_NS, "svg");
@@ -2001,10 +2050,10 @@ function renderScopePopupPlot(popup: ScopePopupState, history: number[][]): SVGS
   for (const channel of channelIndices) {
     const settings = popup.channels[channel];
     if (!settings || settings.mode === "hide") continue;
-    const fullHistory = history[channel] ?? [];
-    const anchor = settings.mode === "trigger" ? findTriggerAnchorIndex(fullHistory, 2.5) : undefined;
-    const { start, end } = visibleSampleWindow(fullHistory.length, popup.timeDivMs, popup.timePosMs, anchor);
-    const samples = fullHistory.slice(start, end + 1);
+    const fullHistory = channels[channel] ?? { timestampsNs: [], values: [] };
+    const anchor = settings.mode === "trigger" ? findTriggerAnchorIndex(fullHistory.values, popup.triggerLevel) : undefined;
+    const { start, end } = visibleSampleWindow(fullHistory.timestampsNs, popup.timeDivMs, popup.timePosMs, anchor);
+    const samples = fullHistory.values.slice(start, end + 1);
     const voltsPerPx = (settings.voltDiv * 8) / plotH; // 8 divisões verticais
     const valueToY = (value: number) => plotH / 2 - (value + settings.voltPos) / voltsPerPx;
     markup += `<path d="${instrumentPlotPolyline(samples, plotW, valueToY)}" fill="none" stroke="${INSTRUMENT_CHANNEL_COLORS[channel]}" stroke-width="2"/>`;
@@ -2013,7 +2062,7 @@ function renderScopePopupPlot(popup: ScopePopupState, history: number[][]): SVGS
   return svg;
 }
 
-function renderLogicPopupPlot(popup: LogicPopupState, history: number[]): SVGSVGElement {
+function renderLogicPopupPlot(popup: LogicPopupState, history: { timestampsNs: number[]; masks: number[] }): SVGSVGElement {
   const plotW = 700;
   const plotH = 320;
   const svg = document.createElementNS(SVG_NS, "svg");
@@ -2024,10 +2073,10 @@ function renderLogicPopupPlot(popup: LogicPopupState, history: number[]): SVGSVG
   const visibleChannels = INSTRUMENT_CHANNEL_COLORS.map((_, ch) => ch).filter((ch) => !popup.hiddenChannels[ch]);
   const rowH = plotH / Math.max(1, visibleChannels.length);
   const anchor = popup.triggerChannel !== "none"
-    ? findTriggerAnchorIndex(history.map((mask) => ((mask >>> (popup.triggerChannel as number)) & 1)), 1)
+    ? findTriggerAnchorIndex(history.masks.map((mask) => ((mask >>> (popup.triggerChannel as number)) & 1)), 1)
     : undefined;
-  const { start, end } = visibleSampleWindow(history.length, popup.timeDivMs, popup.timePosMs, anchor);
-  const samples = history.slice(start, end + 1);
+  const { start, end } = visibleSampleWindow(history.timestampsNs, popup.timeDivMs, popup.timePosMs, anchor);
+  const samples = history.masks.slice(start, end + 1);
 
   visibleChannels.forEach((channel, row) => {
     const rowTop = row * rowH;
@@ -2131,7 +2180,7 @@ function buildScopePopup(popup: ScopePopupState, component: WebviewComponentMode
 
   const plotWrap = document.createElement("div");
   plotWrap.className = "instrument-popup__plot";
-  plotWrap.appendChild(renderScopePopupPlot(popup, scopeHistoryByComponentId[component.id] ?? [[], [], [], []]));
+  plotWrap.appendChild(renderScopePopupPlot(popup, scopeChannelsFor(component.id)));
 
   const controls = document.createElement("div");
   controls.className = "instrument-popup__controls";
@@ -2155,7 +2204,7 @@ function buildScopePopup(popup: ScopePopupState, component: WebviewComponentMode
   knobs.appendChild(makeFieldRow("Divisão de Tempo (ms)", makeNumberInput(popup.timeDivMs, 100, (v) => { popup.timeDivMs = Math.max(10, v); renderInstrumentPopups(); })));
   knobs.appendChild(makeFieldRow("Posição de Tempo (ms)", makeNumberInput(popup.timePosMs, 100, (v) => { popup.timePosMs = v; renderInstrumentPopups(); })));
   const activeChannelIndex = popup.activeTab === "all" ? 0 : popup.activeTab;
-  const activeChannel = popup.channels[activeChannelIndex];
+  const activeChannel = popup.channels[activeChannelIndex] ?? popup.channels[0]!;
   knobs.appendChild(makeFieldRow("Divisão de Tensão (V)", makeNumberInput(activeChannel.voltDiv, 0.1, (v) => { activeChannel.voltDiv = Math.max(0.01, v); renderInstrumentPopups(); })));
   knobs.appendChild(makeFieldRow("Posição de Tensão (V)", makeNumberInput(activeChannel.voltPos, 0.1, (v) => { activeChannel.voltPos = v; renderInstrumentPopups(); })));
   controls.appendChild(knobs);
@@ -2167,7 +2216,7 @@ function buildScopePopup(popup: ScopePopupState, component: WebviewComponentMode
     row.className = "instrument-channel-row";
     const swatch = document.createElement("span");
     swatch.className = "instrument-channel-swatch";
-    swatch.style.background = INSTRUMENT_CHANNEL_COLORS[channel];
+    swatch.style.background = INSTRUMENT_CHANNEL_COLORS[channel] ?? "#888";
     row.appendChild(swatch);
     (["auto", "trigger", "hide"] as const).forEach((mode) => {
       const radioLabel = document.createElement("label");
@@ -2206,13 +2255,15 @@ function buildScopePopup(popup: ScopePopupState, component: WebviewComponentMode
   });
   controls.appendChild(tracksRow);
 
+  controls.appendChild(makeFieldRow("Nível de Trigger (V)", makeNumberInput(popup.triggerLevel, 0.1, (v) => { popup.triggerLevel = v; renderInstrumentPopups(); })));
+
   body.append(plotWrap, controls);
   return container;
 }
 
 function buildLogicPopup(popup: LogicPopupState, component: WebviewComponentModel): HTMLDivElement {
   const { container, body } = makePopupChrome(`LAnalizer-${component.label || component.id}`, popup);
-  const history = logicHistoryByComponentId[component.id] ?? [];
+  const history = logicChannelFor(component.id);
 
   const plotWrap = document.createElement("div");
   plotWrap.className = "instrument-popup__plot";
@@ -2239,7 +2290,7 @@ function buildLogicPopup(popup: LogicPopupState, component: WebviewComponentMode
     row.className = "instrument-channel-row";
     const swatch = document.createElement("span");
     swatch.className = "instrument-channel-swatch";
-    swatch.style.background = INSTRUMENT_CHANNEL_COLORS[channel];
+    swatch.style.background = INSTRUMENT_CHANNEL_COLORS[channel] ?? "#888";
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.checked = !hidden;
@@ -2289,24 +2340,27 @@ function buildLogicPopup(popup: LogicPopupState, component: WebviewComponentMode
   return container;
 }
 
-/** CSV simples (índice de amostra + 1 coluna por canal visível) -- sem timestamp real de simulação
- * (só o intervalo de poll de 300ms da Extension, ver `INSTRUMENT_POLL_INTERVAL_MS`); a coluna
- * "tempo_ms" já deixa isso explícito (aproximado, não o clock interno do circuito) em vez de fingir
- * precisão que não existe. */
-function exportInstrumentData(component: WebviewComponentModel, popup: InstrumentPopupState, history: number[] | number[][]): void {
+/** CSV com timestamp REAL (tempo simulado, convertido pra ms -- `timestampsNs[i] / 1e6`) quando o
+ * histórico real já chegou (ver `realLogicHistoryByComponentId`/`realScopeHistoryByComponentId`);
+ * cai pro timestamp aproximado (intervalo de poll) só se a janela acabou de abrir e a resposta de
+ * `requestInstrumentHistory` ainda não chegou. */
+function exportInstrumentData(component: WebviewComponentModel, popup: InstrumentPopupState, history: { timestampsNs: number[]; masks: number[] } | Array<{ timestampsNs: number[]; values: number[] }>): void {
   const lines: string[] = [];
   if (popup.kind === "logic") {
+    const logic = history as { timestampsNs: number[]; masks: number[] };
     const visibleChannels = popup.hiddenChannels.map((hidden, ch) => (hidden ? -1 : ch)).filter((ch) => ch >= 0);
     lines.push(["tempo_ms", ...visibleChannels.map((ch) => `ch${ch}`)].join(","));
-    (history as number[]).forEach((mask, index) => {
-      lines.push([index * INSTRUMENT_POLL_INTERVAL_MS, ...visibleChannels.map((ch) => (mask >>> ch) & 1)].join(","));
+    logic.masks.forEach((mask, index) => {
+      const timeMs = (logic.timestampsNs[index] ?? index * INSTRUMENT_POLL_INTERVAL_MS * 1e6) / 1e6;
+      lines.push([timeMs, ...visibleChannels.map((ch) => (mask >>> ch) & 1)].join(","));
     });
   } else {
-    const matrix = history as number[][];
-    const sampleCount = Math.max(0, ...matrix.map((channel) => channel.length));
+    const channels = history as Array<{ timestampsNs: number[]; values: number[] }>;
+    const sampleCount = Math.max(0, ...channels.map((channel) => channel.values.length));
     lines.push(["tempo_ms", "ch0", "ch1", "ch2", "ch3"].join(","));
     for (let index = 0; index < sampleCount; index++) {
-      lines.push([index * INSTRUMENT_POLL_INTERVAL_MS, ...matrix.map((channel) => channel[index] ?? "")].join(","));
+      const timeMs = (channels[0]?.timestampsNs[index] ?? index * INSTRUMENT_POLL_INTERVAL_MS * 1e6) / 1e6;
+      lines.push([timeMs, ...channels.map((channel) => channel.values[index] ?? "")].join(","));
     }
   }
   send({
@@ -2392,6 +2446,7 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
   const isRail = component.typeId === "sources.rail";
   const isTunnel = component.typeId === "connectors.tunnel";
   const isMeter = component.typeId.startsWith("meters.") || component.typeId === "instruments.voltmeter";
+  const isExpandableInstrument = component.typeId === "meters.oscope" || component.typeId === "meters.logic_analyzer";
   const meterClass = isMeter ? `component--meter component--${component.typeId.replace(/[._]/g, "-")}` : "";
   const isVoltmeter = component.typeId === "instruments.voltmeter"; // só tinge o símbolo, ver styles.css
 
@@ -2569,6 +2624,15 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
     }, { capture: true });
   }
 
+  if (isExpandableInstrument) {
+    el.addEventListener("click", (event) => {
+      if (!(event.target instanceof Element) || !event.target.closest(".meter-expand-button")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      toggleInstrumentPopup(component);
+    }, { capture: true });
+  }
+
   el.addEventListener("click", (event) => {
     event.stopPropagation();
     if (event.shiftKey) toggleComponentSelection(component.id);
@@ -2622,7 +2686,7 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
 
   el.addEventListener("pointerdown", (event) => {
     if (event.button !== 0) return;
-    if (event.target instanceof Element && event.target.closest(".pin-terminal")) return;
+    if (event.target instanceof Element && event.target.closest(".pin-terminal, .meter-expand-button")) return;
     event.stopPropagation();
     if (event.shiftKey) {
       toggleComponentSelection(component.id);
@@ -3037,6 +3101,12 @@ window.addEventListener("message", (event: MessageEvent<HostToWebviewMessage>) =
     updateReadoutHistories(message.readoutsByComponentId);
     render();
     refreshOpenPropertyDialog();
+  }
+
+  if (message.type === "instrumentHistory") {
+    if (message.oscope) realScopeHistoryByComponentId.set(message.componentId, message.oscope.channels);
+    if (message.logic) realLogicHistoryByComponentId.set(message.componentId, message.logic);
+    renderInstrumentPopups();
   }
 
   if (message.type === "wireVoltages") {

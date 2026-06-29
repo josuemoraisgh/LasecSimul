@@ -9,7 +9,7 @@ import { isPreApproved, isPreBlocked, resolveConsentChoice, shouldLoadLibrary, d
 import { SchematicPanel } from "./ui/panels/SchematicPanel";
 import { createInitialWebviewState } from "./ui/webview/catalog";
 import { PackageDescriptor, PackagePin, PackageShape, PropertySchemaEntry, WebviewComponentCatalogEntry, WebviewComponentModel, WebviewProjectState, WebviewWireModel } from "./ui/webview/model";
-import { ComponentReadoutValue, SimulationStatus, WebviewToHostMessage } from "./ui/webview/messages";
+import { ComponentReadoutValue, InstrumentHistoryPayload, SimulationStatus, WebviewToHostMessage } from "./ui/webview/messages";
 import { ComponentPaletteViewProvider } from "./ui/views/ComponentPaletteViewProvider";
 import { ProjectSerializer } from "./project/ProjectSerializer";
 import { ProjectComponent, ProjectDocument, createEmptyProject } from "./project/ProjectTypes";
@@ -640,6 +640,67 @@ function decodeComponentReadout(typeId: string, state: Buffer): ComponentReadout
   return undefined;
 }
 
+/** Decodifica o histórico REAL (tempo simulado, ver doc de `Oscope.hpp`/`LogicAnalyzer.hpp`) do
+ * mesmo `getComponentState()` que `decodeComponentReadout` já usa pra última leitura -- formato:
+ * Oscope = [0..32) 4 doubles + [32..36) uint32 contagem + histórico CHANNEL-MAJOR, cada amostra
+ * {uint64 timestampNs, double value}; LogicAnalyzer = [0..4) uint32 + [4..8) uint32 contagem +
+ * histórico {uint64 timestampNs, uint32 bitmask}. Espelha EXATAMENTE o `getState()` de cada
+ * classe -- mudar um lado sem o outro quebra silenciosamente (offsets batem por construção, não
+ * por validação em runtime). */
+function decodeInstrumentHistory(typeId: string, state: Buffer): InstrumentHistoryPayload["oscope"] | InstrumentHistoryPayload["logic"] | undefined {
+  if (typeId === "meters.oscope") {
+    if (state.length < 36) return undefined;
+    const sampleCount = state.readUInt32LE(32);
+    const channels: Array<{ timestampsNs: number[]; values: number[] }> = [];
+    let offset = 36;
+    for (let channel = 0; channel < 4; channel++) {
+      const timestampsNs: number[] = [];
+      const values: number[] = [];
+      for (let i = 0; i < sampleCount; i++) {
+        timestampsNs.push(Number(state.readBigUInt64LE(offset)));
+        values.push(state.readDoubleLE(offset + 8));
+        offset += 16;
+      }
+      channels.push({ timestampsNs, values });
+    }
+    return { channels };
+  }
+  if (typeId === "meters.logic_analyzer") {
+    if (state.length < 8) return undefined;
+    const sampleCount = state.readUInt32LE(4);
+    const timestampsNs: number[] = [];
+    const masks: number[] = [];
+    let offset = 8;
+    for (let i = 0; i < sampleCount; i++) {
+      timestampsNs.push(Number(state.readBigUInt64LE(offset)));
+      masks.push(state.readUInt32LE(offset + 8));
+      offset += 12;
+    }
+    return { timestampsNs, masks };
+  }
+  return undefined;
+}
+
+async function sendInstrumentHistory(componentId: string): Promise<void> {
+  if (!coreClient || !schematicPanel) return;
+  const component = schematicState.components.find((entry) => entry.id === componentId);
+  if (!component) return;
+  const coreId = coreInstanceIdByComponentId.get(componentId);
+  if (!coreId) return;
+  try {
+    const state = await coreClient.getComponentState(coreId);
+    const decoded = decodeInstrumentHistory(component.typeId, state);
+    if (!decoded) return;
+    const payload: InstrumentHistoryPayload =
+      component.typeId === "meters.oscope"
+        ? { componentId, oscope: decoded as InstrumentHistoryPayload["oscope"] }
+        : { componentId, logic: decoded as InstrumentHistoryPayload["logic"] };
+    schematicPanel.postMessage({ version: 1, type: "instrumentHistory", ...payload });
+  } catch {
+    // instância ainda não assentou ou foi removida -- ignora, a próxima tentativa (popup ainda aberto) cobre
+  }
+}
+
 function isReadableInstrument(typeId: string): boolean {
   return (
     typeId === "instruments.voltmeter" ||
@@ -1250,6 +1311,9 @@ function handleWebviewMessage(message: WebviewToHostMessage): void {
       return;
     case "requestExportInstrumentData":
       void exportInstrumentDataCommand(message.suggestedFileName, message.csvContent);
+      return;
+    case "requestInstrumentHistory":
+      void sendInstrumentHistory(message.componentId);
       return;
   }
 }

@@ -1,13 +1,16 @@
 // Teste de integração dos componentes "Fontes"/"Medidores" portados do SimulIDE (ver pasta
 // Medidores/Fontes da paleta original) — Battery, Rail, FixedVolt, VoltSource, CurrSource,
-// Csource, Clock, Ampmeter. Mesmo padrão de voltage_divider_test.cpp/diode_test.cpp: settleStep()
-// chamado direto, sem framework de teste.
+// Csource, Clock, Ampmeter, Oscope, LogicAnalyzer. Mesmo padrão de voltage_divider_test.cpp/
+// diode_test.cpp: settleStep() chamado direto, sem framework de teste.
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include "components/meters/Ampmeter.hpp"
+#include "components/meters/LogicAnalyzer.hpp"
+#include "components/meters/Oscope.hpp"
 #include "components/other/Ground.hpp"
 #include "components/passive/Resistor.hpp"
 #include "components/sources/Battery.hpp"
@@ -333,6 +336,124 @@ void testWaveGenSquareWaveOutputsExpectedVoltageAndCurrent() {
     checkCurrent(session, wave, -0.0025, 1e-4, "WaveGen: current() = -2.5mA no nivel alto");
 }
 
+uint64_t readU64(const std::vector<uint8_t>& bytes, size_t offset) {
+    uint64_t value = 0;
+    std::memcpy(&value, bytes.data() + offset, sizeof(value));
+    return value;
+}
+uint32_t readU32(const std::vector<uint8_t>& bytes, size_t offset) {
+    uint32_t value = 0;
+    std::memcpy(&value, bytes.data() + offset, sizeof(value));
+    return value;
+}
+double readF64(const std::vector<uint8_t>& bytes, size_t offset) {
+    double value = 0;
+    std::memcpy(&value, bytes.data() + offset, sizeof(value));
+    return value;
+}
+
+/** Prova que `Oscope::getState()` grava histórico com timestamp REAL de tempo simulado (não um
+ * contador de poll de IPC) -- 2026-06-29, resolve a limitação anotada na sessão anterior. Avança o
+ * Scheduler "a seco" (`runUntil` + `markDirty` manual -- Oscope não se auto-agenda, só amostra a
+ * cada `stamp()`) por mais do que `kHistoryCapacity` voltas pra provar também o wraparound do ring
+ * buffer (mais antigas saem, contagem nunca passa da capacidade). */
+void testOscopeRecordsTimestampedHistoryWithWraparound() {
+    GlobalPluginCache cache;
+    SimulationSession session(cache);
+    registerCommon(session.components());
+    session.components().registerFactory("meters.oscope", [&session](const ComponentParams& p) {
+        const auto pos = p.pins<4>();
+        return std::make_unique<components::Oscope>(
+            session.scheduler(), std::array<Pin, 4>{Pin{pos[0].id.empty() ? "ch0" : pos[0].id},
+                                                     Pin{pos[1].id.empty() ? "ch1" : pos[1].id},
+                                                     Pin{pos[2].id.empty() ? "ch2" : pos[2].id},
+                                                     Pin{pos[3].id.empty() ? "ch3" : pos[3].id}});
+    });
+    session.components().registerFactory("sources.dc_voltage", [](const ComponentParams& p) {
+        return std::make_unique<components::DcVoltageSource>(std::array<Pin, 2>{Pin{"p1"}, Pin{"p2"}}, p.property("voltage", 5.0));
+    });
+
+    const uint32_t oscope = session.addComponent("meters.oscope", {});
+    const uint32_t source = session.addComponent("sources.dc_voltage", withProp("voltage", 3.3));
+    const uint32_t ground = session.addComponent("other.ground", {});
+    session.connectWire(source, "p1", oscope, "ch0");
+    session.connectWire(source, "p2", ground, "pin");
+
+    for (int i = 0; i < 10 && session.settleStep(); ++i) {}
+
+    // Intervalo padrao de amostra e' 50000ns -- avanca de 60000ns em 60000ns (sempre > intervalo,
+    // sempre grava 1 amostra nova por rodada) por mais voltas que a capacidade do buffer (512).
+    constexpr uint64_t kStepNs = 60'000;
+    constexpr int kRounds = static_cast<int>(components::Oscope::kHistoryCapacity) + 50;
+    for (int round = 0; round < kRounds; ++round) {
+        session.scheduler().runUntil(session.scheduler().nowNs() + kStepNs);
+        session.scheduler().markDirty(oscope);
+        for (int i = 0; i < 5 && session.settleStep(); ++i) {}
+    }
+
+    const std::vector<uint8_t> state = session.getComponentState(oscope);
+    check(state.size() >= sizeof(double) * 4 + sizeof(uint32_t), "Oscope: getState() devolve pelo menos o cabecalho (4 doubles + contagem)");
+    check(nearlyEqual(readF64(state, 0), 3.3, 1e-6), "Oscope: getState() primeiros 32 bytes = ultima leitura real (ch0=3.3V)");
+
+    const uint32_t sampleCount = readU32(state, sizeof(double) * 4);
+    check(sampleCount == components::Oscope::kHistoryCapacity,
+          "Oscope: contagem de amostras satura na capacidade do ring buffer (nunca excede, mesmo apos muitas voltas)");
+
+    const size_t historyOffset = sizeof(double) * 4 + sizeof(uint32_t);
+    const uint64_t firstTimestamp = readU64(state, historyOffset);
+    const uint64_t secondTimestamp = readU64(state, historyOffset + 8 + 8);
+    const uint64_t lastTimestamp = readU64(state, historyOffset + (sampleCount - 1) * 16);
+    check(secondTimestamp > firstTimestamp, "Oscope: timestamps do historico avancam em ordem cronologica (tempo SIMULADO real)");
+    check(lastTimestamp > firstTimestamp, "Oscope: timestamp mais recente > timestamp mais antigo ainda no buffer");
+    check(nearlyEqual(readF64(state, historyOffset + 8), 3.3, 1e-6), "Oscope: valor gravado no historico bate com a tensao real (3.3V)");
+    std::printf("[info] Oscope: %u amostras, timestamps [%llu .. %llu] ns (passo nominal %lluns)\n",
+                sampleCount, static_cast<unsigned long long>(firstTimestamp), static_cast<unsigned long long>(lastTimestamp),
+                static_cast<unsigned long long>(kStepNs));
+}
+
+/** Mesma prova de `LogicAnalyzer`, formato mais simples (bitmask em vez de 4 doubles). */
+void testLogicAnalyzerRecordsTimestampedHistory() {
+    GlobalPluginCache cache;
+    SimulationSession session(cache);
+    registerCommon(session.components());
+    session.components().registerFactory("meters.logic_analyzer", [&session](const ComponentParams& p) {
+        const auto pos = p.pins<8>();
+        std::array<Pin, 8> pins{};
+        for (size_t i = 0; i < 8; ++i) pins[i] = Pin{pos[i].id.empty() ? ("ch" + std::to_string(i)) : pos[i].id};
+        return std::make_unique<components::LogicAnalyzer>(session.scheduler(), pins, p.property("threshold", 2.5));
+    });
+    session.components().registerFactory("sources.dc_voltage", [](const ComponentParams& p) {
+        return std::make_unique<components::DcVoltageSource>(std::array<Pin, 2>{Pin{"p1"}, Pin{"p2"}}, p.property("voltage", 5.0));
+    });
+
+    const uint32_t analyzer = session.addComponent("meters.logic_analyzer", {});
+    const uint32_t source = session.addComponent("sources.dc_voltage", withProp("voltage", 5.0));
+    const uint32_t ground = session.addComponent("other.ground", {});
+    session.connectWire(source, "p1", analyzer, "ch0");
+    session.connectWire(source, "p2", ground, "pin");
+
+    for (int i = 0; i < 10 && session.settleStep(); ++i) {}
+    for (int round = 0; round < 5; ++round) {
+        session.scheduler().runUntil(session.scheduler().nowNs() + 60'000);
+        session.scheduler().markDirty(analyzer);
+        for (int i = 0; i < 5 && session.settleStep(); ++i) {}
+    }
+
+    const std::vector<uint8_t> state = session.getComponentState(analyzer);
+    check(state.size() >= sizeof(uint32_t) * 2, "LogicAnalyzer: getState() devolve pelo menos o cabecalho");
+    const uint32_t latestMask = readU32(state, 0);
+    check((latestMask & 1u) == 1u, "LogicAnalyzer: bitmask mais recente marca ch0 em alto (5V > limiar de 2.5V)");
+
+    const uint32_t sampleCount = readU32(state, sizeof(uint32_t));
+    check(sampleCount >= 5, "LogicAnalyzer: gravou pelo menos uma amostra por rodada de avanco de tempo");
+    const size_t historyOffset = sizeof(uint32_t) * 2;
+    const uint64_t firstTimestamp = readU64(state, historyOffset);
+    const uint64_t lastTimestamp = readU64(state, historyOffset + (sampleCount - 1) * 12);
+    check(lastTimestamp > firstTimestamp, "LogicAnalyzer: timestamps do historico avancam em tempo simulado real");
+    const uint32_t firstMask = readU32(state, historyOffset + 8);
+    check((firstMask & 1u) == 1u, "LogicAnalyzer: bitmask gravado no historico reflete o canal em alto");
+}
+
 } // namespace
 
 int main() {
@@ -345,6 +466,8 @@ int main() {
     testAmpmeterMeasuresSeriesCurrentAndForwardsToOutputPin();
     testClockTogglesOverTime();
     testWaveGenSquareWaveOutputsExpectedVoltageAndCurrent();
+    testOscopeRecordsTimestampedHistoryWithWraparound();
+    testLogicAnalyzerRecordsTimestampedHistory();
 
     if (failures == 0) {
         std::printf("\nTodos os testes de Fontes/Medidores SimulIDE passaram.\n");

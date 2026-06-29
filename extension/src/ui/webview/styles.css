@@ -781,3 +781,178 @@ html, body {
   color: #8d8d8d;
   cursor: default;
 }
+
+/* Janela "Expande" do osciloscópio/analisador lógico -- igual ao OscWidget/LogicAnalyzerWidget
+   flutuante do SimulIDE real, fora do .canvas-content (não escala/pan com o zoom do esquemático). */
+.instrument-popup-layer {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 20;
+}
+
+.instrument-popup {
+  position: absolute;
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  background: #cfd3da;
+  border: 1px solid #6b6f76;
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+  color: #1c1e22;
+}
+
+.instrument-popup__titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  background: linear-gradient(180deg, #4a4f58, #2c2f35);
+  color: #fff;
+  font-weight: 700;
+  cursor: move;
+  border-radius: 4px 4px 0 0;
+}
+
+.instrument-popup__close {
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 2px;
+  background: #c0392b;
+  color: #fff;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.instrument-popup__close:hover {
+  background: #e74c3c;
+}
+
+.instrument-popup__body {
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+}
+
+.instrument-popup__plot {
+  flex: 0 0 auto;
+}
+
+.instrument-plot-svg {
+  width: 560px;
+  height: 280px;
+  border: 2px solid #444;
+  border-radius: 4px;
+}
+
+.instrument-plot-grid {
+  stroke: #2e2e2e;
+  stroke-width: 1;
+}
+
+.instrument-plot-grid--center {
+  stroke: #4a4a4a;
+}
+
+.instrument-popup__controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 190px;
+}
+
+.instrument-tabs {
+  display: flex;
+  gap: 2px;
+}
+
+.instrument-tab {
+  flex: 1;
+  padding: 3px 4px;
+  border: 1px solid #8a8e96;
+  background: #e6e8ec;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.instrument-tab--active {
+  background: #fff;
+  font-weight: 700;
+  border-color: #2c2f35;
+}
+
+.instrument-knobs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: #e6e8ec;
+  border: 1px solid #8a8e96;
+  border-radius: 3px;
+  padding: 6px;
+}
+
+.instrument-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.instrument-field label {
+  font-size: 11px;
+  flex: 1;
+}
+
+.instrument-field input[type="number"] {
+  width: 72px;
+}
+
+.instrument-section-label {
+  font-weight: 700;
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.instrument-channel-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.instrument-channel-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.instrument-channel-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.instrument-channel-swatch {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 1px solid #777;
+  border-radius: 2px;
+}
+
+.instrument-export-button {
+  margin-top: 4px;
+  padding: 5px 8px;
+  border: 1px solid #6b6f76;
+  border-radius: 3px;
+  background: #e6e8ec;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.instrument-export-button:hover {
+  background: #d4d7dc;
+}

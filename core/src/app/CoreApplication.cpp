@@ -488,19 +488,19 @@ void registerBuiltinComponents(ComponentRegistry& reg, registry::ComponentMetada
     registerBuiltinMetadata("meters.freqmeter", "Frequencímetro", components::FreqMeter::propertySchema(),
                             englishName("Frequency Meter"));
 
-    reg.registerFactory("meters.oscope", [](const ComponentParams& p) {
+    reg.registerFactory("meters.oscope", [&scheduler](const ComponentParams& p) {
         const auto pos = makePinVector(p, components::Oscope::kChannelCount);
         return std::make_unique<components::Oscope>(
-            std::array<Pin, components::Oscope::kChannelCount>{pos[0], pos[1], pos[2], pos[3]});
+            scheduler, std::array<Pin, components::Oscope::kChannelCount>{pos[0], pos[1], pos[2], pos[3]});
     });
     registerBuiltinMetadata("meters.oscope", "Osciloscópio", components::Oscope::propertySchema(),
                             englishName("Oscilloscope"));
 
-    reg.registerFactory("meters.logic_analyzer", [](const ComponentParams& p) {
+    reg.registerFactory("meters.logic_analyzer", [&scheduler](const ComponentParams& p) {
         const auto pos = makePinVector(p, components::LogicAnalyzer::kChannelCount);
         std::array<Pin, components::LogicAnalyzer::kChannelCount> pins{};
         for (size_t i = 0; i < components::LogicAnalyzer::kChannelCount; ++i) pins[i] = pos[i];
-        return std::make_unique<components::LogicAnalyzer>(pins, p.property("threshold", 2.5));
+        return std::make_unique<components::LogicAnalyzer>(scheduler, pins, p.property("threshold", 2.5));
     });
     registerBuiltinMetadata("meters.logic_analyzer", "Analisador Lógico", components::LogicAnalyzer::propertySchema(),
                             englishName("Logic Analyzer"));

@@ -305,7 +305,11 @@ std::vector<uint8_t> SimulationSession::getComponentState(uint32_t componentInde
     IComponentModel* instance = m_componentInstances.at(componentIndex).get();
     if (!instance) throw std::runtime_error("getComponentState: componente removido");
 
-    std::vector<uint8_t> buffer(256);
+    // 64KiB cobre com folga o maior caso real hoje (Oscope::kHistoryCapacity=512 * 4 canais * 16
+    // bytes/amostra ~= 32KiB, ver Oscope.hpp) -- componentes com estado pequeno (a maioria) só
+    // usam uma fração disto; `getState()` sempre devolve só os bytes realmente escritos, então
+    // este buffer maior não muda o tamanho da resposta de quem já era pequeno.
+    std::vector<uint8_t> buffer(65536);
     const size_t written = instance->getState(buffer.data(), buffer.size());
     buffer.resize(written);
     return buffer;

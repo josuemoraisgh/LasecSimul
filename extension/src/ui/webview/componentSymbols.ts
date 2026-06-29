@@ -300,10 +300,10 @@ const COMPONENT_BOX: Record<string, ComponentBox> = {
   "outputs.incandescent_lamp": { width: 72, height: 52 },
   "instruments.voltmeter": { width: 82, height: 56 },
 
-  "meters.probe": { width: 82, height: 44 },
+  "meters.probe": { width: 82, height: 58 },
   "meters.ampmeter": { width: 82, height: 56 },
   "meters.freqmeter": { width: 116, height: 34 },
-  "meters.oscope": { width: 260, height: 150 },
+  "meters.oscope": { width: 260, height: 180 },
   "meters.logic_analyzer": { width: 260, height: 212 },
 
   "sources.fixed_volt": { width: 76, height: 54 },
@@ -514,13 +514,17 @@ function scopePanelSvg(properties?: Record<string, unknown>): string {
   const plotX = 104;
   const plotY = 8;
   const plotW = 146;
-  const plotH = 134;
+  const plotH = 154;
+  // Selo (cor) e valor na MESMA linha (não rótulo empilhado acima do selo) -- cabia "tecnicamente"
+  // empilhado, mas em 4 canais ficava espremido contra o botão "Expande" embaixo (overlap real de
+  // ~6px entre o último selo e o botão, reportado como "texto fora do lugar"). Mais respiro vertical
+  // (height 150->180) some com a colisão de propósito, não só corta o sintoma.
   const rows = colors.map((color, index) => {
-    const y = 16 + index * 29;
+    const y = 16 + index * 30;
     const label = `${formatRailVoltage(latest[index] ?? 0)} V`;
     return (
-      `<text x="18" y="${y}" class="meter-panel-label">${escapeXmlText(label)}</text>` +
-      `<rect x="18" y="${y + 5}" width="78" height="20" rx="2" fill="${color}" stroke="#777"/>`
+      `<rect x="18" y="${y}" width="50" height="20" rx="2" fill="${color}" stroke="#777"/>` +
+      `<text x="74" y="${y + 14}" class="meter-panel-label">${escapeXmlText(label)}</text>`
     );
   }).join("");
   const traces = colors.map((color, index) => {
@@ -528,10 +532,10 @@ function scopePanelSvg(properties?: Record<string, unknown>): string {
     return `<path d="${tracePath(history, plotX + 7, plotY + 14, plotW - 14, plotH - 28)}" fill="none" stroke="${color}" stroke-width="2"/>`;
   }).join("");
   return (
-    `<rect x="4" y="2" width="252" height="146" rx="6" fill="#f7f7f7" stroke="currentColor" stroke-width="2"/>` +
+    `<rect x="4" y="2" width="252" height="166" rx="6" fill="#f7f7f7" stroke="currentColor" stroke-width="2"/>` +
     rows +
-    `<rect x="18" y="122" width="78" height="20" rx="3" class="meter-expand-button"/>` +
-    `<text x="31" y="136" class="meter-panel-button">Expande</text>` +
+    `<rect x="18" y="140" width="78" height="20" rx="3" class="meter-expand-button"/>` +
+    `<text x="31" y="154" class="meter-panel-button">Expande</text>` +
     `<rect x="${plotX}" y="${plotY}" width="${plotW}" height="${plotH}" rx="6" fill="#050505" stroke="currentColor" stroke-width="3"/>` +
     plotGridSvg(plotX, plotY, plotW, plotH) +
     traces
@@ -1024,13 +1028,20 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
       return smallMeterDisplaySvg(box, "V", symbolReadoutNumber(properties));
 
     // ── Medidores (pasta "Meters" do SimulIDE) ──────────────────────────────────
-    case "meters.probe":
+    case "meters.probe": {
       // Sonda de 1 pino: linha até o corpo + círculo, igual a Probe::paint do SimulIDE (Component::
-      // paint + drawEllipse) -- sem leads horizontais (só 1 pino, no topo).
+      // paint + drawEllipse) -- sem leads horizontais (só 1 pino, no topo). Círculo deslocado mais
+      // pra baixo (yMid menor que o centro real) pra abrir vão visível entre o terminal do pino
+      // (ponta do lead, ver pinLocalPosition) e o corpo -- box baixa demais (44px) deixava os dois
+      // quase colados, parecendo um "boneco de neve" em vez de pino+sonda.
+      const bodyY = 30;
+      const showVolt = properties?.showVolt !== false;
       return (
-        `<line x1="${midX}" y1="${PIN_INSET}" x2="${midX}" y2="${yMid - 8}" class="symbol-stroke"/>` +
-        `<circle cx="${midX}" cy="${yMid}" r="8" class="symbol-stroke" fill="none"/>`
+        `<line x1="${midX}" y1="${PIN_INSET}" x2="${midX}" y2="${bodyY - 10}" class="symbol-stroke"/>` +
+        `<circle cx="${midX}" cy="${bodyY}" r="10" class="symbol-stroke" fill="none"/>` +
+        (showVolt ? `<text x="${midX}" y="${box.height - 6}" text-anchor="middle" class="probe-voltage-label">${escapeXmlText(formatRailVoltage(symbolReadoutNumber(properties) ?? 0))} V</text>` : "")
       );
+    }
 
     case "meters.ampmeter":
       return smallMeterDisplaySvg(box, "A", symbolReadoutNumber(properties));
