@@ -136,6 +136,14 @@ public:
     std::optional<std::string> setProperty(uint32_t component, const std::string& propertyName,
                                            const PropertyValue& value);
 
+    /** Resolve o id LOCAL de um componente dentro de um subcircuito (ex: "button_en" no
+     * `.lssub.json`) pro índice REAL do componente no Core -- usado pelo overlay de Modo Placa no
+     * circuito principal (Extension não tem acesso a `componentIndexByLocalId`, que é local de
+     * `expandSubcircuit()`). `subcircuitInstanceId` é o id COM a flag (`kSubcircuitInstanceFlag`),
+     * mesmo valor devolvido por `addSubcircuitInstance()`. `std::nullopt` se a instância ou o id
+     * local não existem (instância removida, id digitado errado etc.). */
+    std::optional<uint32_t> findSubcircuitChildByLocalId(uint32_t subcircuitInstanceId, const std::string& localId) const;
+
     std::optional<PropertySchema> propertySchemaOf(uint32_t component, const std::string& propertyName) const;
 
     /** Chamado pelo Scheduler (na thread dele, já com o mutex do Scheduler tomado — ver
@@ -163,6 +171,10 @@ private:
     registry::McuRegistry m_mcus;
     registry::SubcircuitRegistry m_subcircuits;
     std::unordered_map<uint32_t, std::vector<uint32_t>> m_subcircuitChildren; // rawId (sem a flag) -> filhos
+    // rawId (sem a flag) -> {id local do .lssub.json -> índice real do componente no Core} --
+    // sobrevive além do escopo de expandSubcircuit() pra permitir endereçar um filho específico por
+    // nome (overlay de Modo Placa, ver findSubcircuitChildByLocalId()).
+    std::unordered_map<uint32_t, std::unordered_map<std::string, uint32_t>> m_subcircuitChildIndexByLocalId;
     uint32_t m_nextSubcircuitInstanceId = 0;
     plugins::PluginRuntime m_pluginRuntime;
     simulation::Netlist m_netlist;

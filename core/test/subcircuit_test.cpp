@@ -222,6 +222,69 @@ void testCycleDetection() {
     std::printf("OK: ciclo de dependência entre subcircuitos é detectado e rejeitado.\n");
 }
 
+/** Prova `findSubcircuitChildByLocalId()` (2026-06-29, suporte ao overlay de Modo Placa da
+ * Extension -- ver `CoreApplication.cpp::"setSubcircuitChildProperty"`): resolve um id LOCAL do
+ * `.lssub.json` (ex: "r1") pro índice real do Core, em duas instâncias INDEPENDENTES (não pode
+ * colidir, mesmo princípio do teste de túneis acima), confirma que editar a propriedade resolvida
+ * tem efeito elétrico real (muda a tensão de saída do divisor), e que IDs inválidos/instância
+ * removida devolvem `std::nullopt` em vez de um índice qualquer. */
+void testFindSubcircuitChildByLocalId() {
+    GlobalPluginCache cache;
+    SimulationSession session(cache);
+    registerTestComponents(session.components());
+    session.subcircuits().registerDefinition(makeDivisor5vDefinition());
+
+    const SubcircuitExpansionResult first = session.addSubcircuitInstance("subcircuits.divisor_5v");
+    const SubcircuitExpansionResult second = session.addSubcircuitInstance("subcircuits.divisor_5v");
+
+    const std::optional<uint32_t> firstR1 = session.findSubcircuitChildByLocalId(first.subcircuitInstanceId, "r1");
+    const std::optional<uint32_t> secondR1 = session.findSubcircuitChildByLocalId(second.subcircuitInstanceId, "r1");
+    if (!firstR1 || !secondR1) {
+        std::fprintf(stderr, "FALHOU: findSubcircuitChildByLocalId deveria achar 'r1' nas duas instâncias\n");
+        std::exit(1);
+    }
+    if (*firstR1 == *secondR1) {
+        std::fprintf(stderr, "FALHOU: 'r1' de instâncias diferentes resolveu pro MESMO índice Core (colisão)\n");
+        std::exit(1);
+    }
+
+    if (session.findSubcircuitChildByLocalId(first.subcircuitInstanceId, "id_que_nao_existe")) {
+        std::fprintf(stderr, "FALHOU: id local inexistente deveria devolver std::nullopt\n");
+        std::exit(1);
+    }
+
+    // Editar r1 (1k -> 3k) por índice resolvido tem efeito elétrico real: divisor deixa de ser 1:1.
+    const uint32_t source = session.addComponent("sources.dc_voltage", withVoltage(10.0));
+    const uint32_t ground = session.addComponent("other.ground", {});
+    const auto& vin = first.exposedPins.at("VIN");
+    const auto& vout = first.exposedPins.at("VOUT");
+    const auto& gnd = first.exposedPins.at("GND");
+    session.connectWire(source, "p1", vin.instanceId, vin.pinId);
+    session.connectWire(gnd.instanceId, gnd.pinId, source, "p2");
+    session.connectWire(gnd.instanceId, gnd.pinId, ground, "pin");
+
+    const std::optional<std::string> error = session.setProperty(*firstR1, "resistance", PropertyValue{3000.0});
+    if (error) {
+        std::fprintf(stderr, "FALHOU: setProperty via índice resolvido devolveu erro: %s\n", error->c_str());
+        std::exit(1);
+    }
+    for (int i = 0; i < 100 && session.settleStep(); ++i) {}
+
+    // R1=3k, R2=1k: Vout = Vin * R2/(R1+R2) = 10 * 1/4 = 2.5V (era 5V com R1=R2=1k).
+    const double voltOut = session.nodeVoltageOfPin(vout.instanceId, vout.pinId);
+    if (!nearlyEqual(voltOut, 2.5, 1e-2)) {
+        std::fprintf(stderr, "FALHOU: apos mudar r1 pra 3k via id local, Vout deveria ser 2.5V, deu %.6f\n", voltOut);
+        std::exit(1);
+    }
+
+    session.removeSubcircuitInstance(first.subcircuitInstanceId);
+    if (session.findSubcircuitChildByLocalId(first.subcircuitInstanceId, "r1")) {
+        std::fprintf(stderr, "FALHOU: apos remover a instancia, 'r1' nao deveria mais resolver\n");
+        std::exit(1);
+    }
+    std::printf("OK: findSubcircuitChildByLocalId resolve por id local, sem colisao entre instancias, com efeito eletrico real, e expira na remocao.\n");
+}
+
 } // namespace
 
 int main() {
@@ -229,6 +292,7 @@ int main() {
     testTwoInstancesDontCollideOnTunnelNames();
     testCascadeRemovalDeletesAllInternalComponents();
     testCycleDetection();
+    testFindSubcircuitChildByLocalId();
     std::printf("\nTodos os testes de subcircuito passaram.\n");
     return 0;
 }

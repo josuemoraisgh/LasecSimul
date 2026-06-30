@@ -30,6 +30,11 @@ export interface UnifiedCatalogItem {
   hidden?: boolean;
   disabled?: boolean;
   disabledReason?: string;
+  /** Igual ao `m_graphical` do SimulIDE real -- ver `model.ts::WebviewComponentCatalogEntry.
+   * graphical` pro papel exato (visibilidade em Modo Placa). Sem isto aqui, o campo `"graphical":
+   * true` já presente em `component-catalog.json` nunca chegava na Webview -- bug encontrado ao
+   * implementar o overlay de Modo Placa no circuito principal. */
+  graphical?: boolean;
 }
 
 /** Tradução de um item do catálogo pra uma língua — subconjunto dos mesmos campos visíveis
@@ -112,6 +117,7 @@ function entryToWebview(item: UnifiedCatalogItem): WebviewComponentCatalogEntry 
     hidden: item.hidden,
     disabled: item.disabled,
     disabledReason: item.disabledReason,
+    graphical: item.graphical,
   };
 }
 

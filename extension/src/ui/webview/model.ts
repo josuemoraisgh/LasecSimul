@@ -43,6 +43,11 @@ export interface WebviewComponentModel {
   boardRotation?: 0 | 90 | 180 | 270;
   boardFlipH?: boolean;
   boardFlipV?: boolean;
+  /** "Selecione os Componentes expostos" -- só relevante pra componentes do circuito INTERNO de um
+   * subcircuito (`isSymbolAuthoringTypeId` é sempre `false`/irrelevante aqui). Sobrevive ao
+   * round-trip de "Abrir Subcircuito" via `InternalComponentSeed.exposed` (ver
+   * `symbolAuthoring.ts`). Ausente == `false`. */
+  exposed?: boolean;
 }
 
 export interface WebviewPoint {
@@ -138,6 +143,9 @@ export interface PackageBackground {
   data?: string;
 }
 
+/** SimulIDE stores Package.Width/Height in schematic grid cells; each cell is 8 scene units. */
+export const SIMULIDE_PACKAGE_GRID_UNIT = 8;
+
 /** Símbolo visual declarativo de um `typeId` — mesmo bloco `package` de `device.json`/`.lssub.json`
  * (`.spec/lasecsimul-native-devices.spec` seção 21, `.spec/lasecsimul-subcircuits.spec` seção 3).
  * Quando presente, o renderizador da Webview desenha o corpo e posiciona cada pino na coordenada
@@ -146,10 +154,21 @@ export interface PackageBackground {
 export interface PackageDescriptor {
   width: number;
   height: number;
+  /** Tamanho EXTERNO no esquemático, independente da malha interna usada por `pins[]`/`shapes[]`.
+   * Porta o comportamento do SimulIDE para placas/imagens reais: o package tem um espaço nativo
+   * (ex: pixels da foto/placa, usado por `boardPos` e pinos), mas a instância no esquemático ocupa
+   * um retângulo lógico menor (`Package.Width/Height` lá, em células de grade). Ausente ==
+   * comportamento legado: usa `width`/`height` como tamanho visual também. */
+  schematicWidth?: number;
+  schematicHeight?: number;
   border?: boolean;
   background?: PackageBackground;
   shapes?: PackageShape[];
   pins: PackagePin[];
+  /** Cor dos rótulos de pinos — padrão `currentColor` (herda do canvas). Usar `"#FAFAC8"` pra
+   * placas com fundo escuro (mesma cor `QColor(250,250,200)` dos rótulos de `PackagePin` do
+   * SimulIDE real). */
+  pinLabelColor?: string;
 }
 
 export interface WebviewComponentCatalogEntry {

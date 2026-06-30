@@ -1,6 +1,6 @@
-import { WEBVIEW_MESSAGE_VERSION, ComponentReadoutValue, HostToWebviewMessage, SimulationStatus, SymbolAuthoringKind, WebviewToHostMessage } from "./messages.js";
+import { WEBVIEW_MESSAGE_VERSION, ComponentReadoutValue, HostToWebviewMessage, InternalComponentSnapshot, SimulationStatus, SymbolAuthoringKind, WebviewToHostMessage } from "./messages.js";
 import { PropertySchemaEntry, WebviewComponentModel, WebviewProjectState, WebviewWireModel } from "./model.js";
-import { PIN_RADIUS, componentBox, componentSymbolSvg, hasRealPinPosition, packageSymbolSvg, pinLocalPosition, registerPackage } from "./componentSymbols.js";
+import { ComponentBox, PIN_RADIUS, componentBox, componentSymbolSvg, hasRealPinPosition, packageSymbolSvg, pinLocalPosition, registerPackage } from "./componentSymbols.js";
 import { detectChannelTrigger, findTriggerAnchorIndex, triggerAlignedWindowEndNs, visibleSampleWindowByTime } from "./instrumentTrigger.js";
 import {
   Point,
@@ -121,6 +121,17 @@ const UI_TEXT = {
     firmwareGroup: "Firmware",
     firmwarePath: "Firmware (.bin/.elf)",
     qemuBinary: "Binario QEMU",
+    loadPackage: "Carregar pacote",
+    savePackage: "Salvar pacote",
+    boardMode: "Modo Placa",
+    exposed: "Exposto",
+    selectExposedComponents: "Selecione os Componentes expostos",
+    exposedComponentsDialogTitle: "Componentes Expostos",
+    exposedComponentsConfirm: "OK",
+    exposedComponentsCancel: "Cancelar",
+    exposedComponentsSelectAll: "Selecionar todos",
+    exposedComponentsClearAll: "Limpar seleção",
+    notGraphicalHint: "(sem efeito visual no Modo Placa)",
   },
   en: {
     nothingSelected: "Nothing selected",
@@ -171,6 +182,17 @@ const UI_TEXT = {
     firmwareGroup: "Firmware",
     firmwarePath: "Firmware (.bin/.elf)",
     qemuBinary: "QEMU binary",
+    loadPackage: "Load Package",
+    savePackage: "Save Package",
+    boardMode: "Board Mode",
+    exposed: "Exposed",
+    selectExposedComponents: "Select Exposed Components",
+    exposedComponentsDialogTitle: "Exposed Components",
+    exposedComponentsConfirm: "OK",
+    exposedComponentsCancel: "Cancel",
+    exposedComponentsSelectAll: "Select all",
+    exposedComponentsClearAll: "Clear selection",
+    notGraphicalHint: "(no visual effect in Board Mode)",
   },
 } as const;
 
@@ -235,7 +257,10 @@ let selectedWireCorner:
     }
   | undefined;
 let simulationStatus: SimulationStatus = "stopped";
-let activePropertyComponentId: string | undefined;
+let activePropertyTarget:
+  | { kind: "project"; componentId: string }
+  | { kind: "exposed-internal"; outerComponentId: string; sourceId: string; snapshot: InternalComponentSnapshot; model: WebviewComponentModel }
+  | undefined;
 let propertyDialogShowAll = false;
 let clipboardItems: { components: WebviewComponentModel[]; wires: WebviewWireModel[] } | undefined;
 const activePushShortcutIds = new Set<string>();
@@ -249,7 +274,7 @@ propertyDialog.addEventListener("click", (event) => {
   if (event.target === propertyDialog) propertyDialog.close();
 });
 propertyDialog.addEventListener("close", () => {
-  activePropertyComponentId = undefined;
+  activePropertyTarget = undefined;
 });
 
 const contextMenu = document.createElement("div");
@@ -257,9 +282,17 @@ contextMenu.className = "context-menu";
 contextMenu.hidden = true;
 document.body.appendChild(contextMenu);
 
+/** Popups de submenu (ver `renderContextMenuItems`) são anexados direto em `document.body`, fora de
+ * `contextMenu` (pra não ficarem limitados pela largura/altura do menu pai) -- por isso precisam
+ * ser removidos do DOM explicitamente ao fechar o menu, senão acumulam elementos órfãos a cada
+ * abertura de um menu com submenu. */
+let openSubmenuPopups: HTMLElement[] = [];
+
 function hideContextMenu(): void {
   contextMenu.hidden = true;
   contextMenu.innerHTML = "";
+  for (const submenu of openSubmenuPopups) submenu.remove();
+  openSubmenuPopups = [];
 }
 
 window.addEventListener("click", () => hideContextMenu());
@@ -278,6 +311,134 @@ let symbolAuthoringContext: { filePath: string; typeId: string; kind: SymbolAuth
  * `kind === "subcircuit-file"` (só subcircuito tem circuito interno pra organizar espacialmente,
  * ver `toggleBoardMode`). */
 let boardModeActive = false;
+
+/** Overlay de Modo Placa no circuito PRINCIPAL (diferente de `boardModeActive`, que só existe
+ * dentro de "Abrir Subcircuito") -- componentes "graphical" expostos de uma instância com
+ * `properties.boardModeEnabled === true` são desenhados sobre a foto do package, na posição
+ * `boardVisual`, e ficam clicáveis durante a simulação (ver `subpackage.cpp::setBoardMode()` real).
+ * Cache por componentId OUTER -- buscado sob demanda (`ensureBoardOverlayData`) só quando Modo
+ * Placa está ligado pra aquela instância, nunca pra todo subcircuito do projeto. */
+const boardOverlayDataByComponentId = new Map<string, InternalComponentSnapshot[]>();
+
+function ensureBoardOverlayData(component: WebviewComponentModel): void {
+  if (boardOverlayDataByComponentId.has(component.id)) return;
+  const sourceId = state.catalog.find((entry) => entry.typeId === component.typeId)?.registeredSourceId;
+  if (!sourceId) return;
+  boardOverlayDataByComponentId.set(component.id, []); // marca "pedido em andamento" -- evita reenviar a cada render()
+  send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestBoardOverlayData", componentId: component.id, sourceId });
+}
+
+/** Desenha os componentes "graphical" expostos de `component` (instância com Modo Placa ligado)
+ * sobre a foto do package, na posição `boardVisual` RELATIVA à posição da instância no circuito
+ * principal. `switches.push`/`switches.switch` ficam clicáveis (igual ao botão EN/BOOT reais
+ * durante a simulação) -- a mudança de estado vai direto pro Core via
+ * `requestUpdateBoardOverlayProperty` (ver `CoreApplication.cpp::"setSubcircuitChildProperty"`),
+ * nunca por `state.components` (estes elementos não fazem parte do circuito do usuário). */
+/** Posição padrão pra um componente exposto que AINDA não foi posicionado em Modo Placa nenhuma
+ * vez (sem `boardVisual` no `.lssub.json`) -- sem isto, marcar "exposto" + ligar "Modo Placa" não
+ * mostrava NADA (bug relatado 2026-06-30: usuário esperava ver um retângulo aparecer mesmo sem
+ * posicionar manualmente antes). Empilha em coluna à DIREITA da foto do package, na ordem que
+ * vieram -- só um ponto de partida razoável; o usuário arrasta pra posição final (ver drag abaixo,
+ * que persiste em `boardVisual` na hora). */
+function fallbackBoardVisualPosition(packageBox: ComponentBox, index: number): { x: number; y: number } {
+  return { x: packageBox.width + 16, y: 8 + index * 64 };
+}
+
+function renderBoardOverlaysFor(component: WebviewComponentModel): HTMLElement[] {
+  const items = boardOverlayDataByComponentId.get(component.id);
+  if (!items || items.length === 0) return [];
+  const packageBox = componentBox(component.typeId, component.properties);
+  const sourceId = state.catalog.find((entry) => entry.typeId === component.typeId)?.registeredSourceId;
+  const elements: HTMLElement[] = [];
+  let fallbackIndex = 0;
+  for (const item of items) {
+    if (!item.exposed || !item.graphical) continue;
+    const boardVisual = item.boardVisual ?? { ...fallbackBoardVisualPosition(packageBox, fallbackIndex++), rotation: 0 as const };
+    const properties: Record<string, string | number | boolean> = { closed: false };
+    const box = componentBox(item.typeId, properties);
+    const el = document.createElement("div");
+    el.className = "component component--board-overlay";
+    el.style.left = `${component.x + boardVisual.x}px`;
+    el.style.top = `${component.y + boardVisual.y}px`;
+    el.style.width = `${box.width}px`;
+    el.style.height = `${box.height}px`;
+    el.style.transform = `rotate(${boardVisual.rotation}deg)`;
+    el.title = item.label;
+
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", `0 0 ${box.width} ${box.height}`);
+    svg.classList.add("component__symbol");
+    svg.innerHTML = componentSymbolSvg(item.typeId, properties);
+    el.appendChild(svg);
+
+    const isPushButton = item.typeId === "switches.push";
+    if (isPushButton) svg.classList.add("component__symbol--push");
+
+    // Arrastar (move/persiste boardVisual) vs apertar/segurar (switches.push) são o MESMO gesto de
+    // pointerdown -- pressiona IMEDIATAMENTE (mesma sensação de "segurar" de sempre), mas cancela o
+    // aperto se detectar movimento além do limiar e vira arrasto (mesmo princípio de qualquer
+    // drag-vs-click, só que aqui o "click" já tem efeito colateral próprio que precisa ser desfeito).
+    el.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const startClientX = event.clientX;
+      const startClientY = event.clientY;
+      const startLeft = component.x + boardVisual.x;
+      const startTop = component.y + boardVisual.y;
+      let dragging = false;
+      let pressed = false;
+      const DRAG_THRESHOLD_PX = 4;
+
+      const setPressed = (value: boolean): void => {
+        if (pressed === value) return;
+        pressed = value;
+        svg.classList.toggle("component__symbol--push-pressed", value);
+        send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateBoardOverlayProperty", outerComponentId: component.id, innerComponentId: item.id, name: "closed", value });
+      };
+      if (isPushButton) setPressed(true);
+
+      const onMove = (moveEvent: PointerEvent): void => {
+        const zoom = state.viewport.zoom || 1;
+        const dx = (moveEvent.clientX - startClientX) / zoom;
+        const dy = (moveEvent.clientY - startClientY) / zoom;
+        if (!dragging && Math.hypot(moveEvent.clientX - startClientX, moveEvent.clientY - startClientY) > DRAG_THRESHOLD_PX) {
+          dragging = true;
+          el.classList.add("dragging");
+          setPressed(false); // movimento detectado -- isto era arrasto, não aperto, desfaz o efeito
+        }
+        if (dragging) {
+          el.style.left = `${startLeft + dx}px`;
+          el.style.top = `${startTop + dy}px`;
+        }
+      };
+      const finish = (moveEvent: PointerEvent): void => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        el.classList.remove("dragging");
+        setPressed(false);
+        if (!dragging) return;
+        const zoom = state.viewport.zoom || 1;
+        const dx = (moveEvent.clientX - startClientX) / zoom;
+        const dy = (moveEvent.clientY - startClientY) / zoom;
+        const newX = boardVisual.x + dx;
+        const newY = boardVisual.y + dy;
+        const cached = boardOverlayDataByComponentId.get(component.id);
+        const cachedItem = cached?.find((entry) => entry.id === item.id);
+        if (cachedItem) cachedItem.boardVisual = { x: newX, y: newY, rotation: boardVisual.rotation, flipH: boardVisual.flipH, flipV: boardVisual.flipV };
+        if (sourceId) send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateBoardOverlayVisual", sourceId, innerComponentId: item.id, x: newX, y: newY });
+        render();
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    });
+
+    elements.push(el);
+  }
+  return elements;
+}
 
 /** Mesmo typeIds "de autoria de símbolo" de `extension/src/catalog/symbolAuthoring.ts::
  * isSymbolAuthoringTypeId` -- duplicado de propósito (webview não importa do host, tsconfigs
@@ -524,27 +685,80 @@ function openSelectedProperties(): void {
 }
 
 function openPropertyDialog(component: WebviewComponentModel): void {
-  activePropertyComponentId = component.id;
+  activePropertyTarget = { kind: "project", componentId: component.id };
   propertyDialog.innerHTML = "";
   propertyDialog.append(renderPropertySheet(component));
   if (!propertyDialog.open) propertyDialog.showModal();
 }
 
+function snapshotToDialogComponent(snapshot: InternalComponentSnapshot): WebviewComponentModel {
+  return {
+    id: snapshot.id,
+    typeId: snapshot.typeId,
+    label: snapshot.label,
+    x: 0,
+    y: 0,
+    rotation: 0,
+    pins: [],
+    properties: { ...snapshot.properties },
+  };
+}
+
+function openExposedInternalPropertyDialog(outerComponentId: string, sourceId: string, snapshot: InternalComponentSnapshot): void {
+  const model = snapshotToDialogComponent(snapshot);
+  activePropertyTarget = { kind: "exposed-internal", outerComponentId, sourceId, snapshot, model };
+  propertyDialog.innerHTML = "";
+  propertyDialog.append(
+    renderPropertySheet(model, {
+      titleText: `Propriedades de ${snapshot.label}`,
+      allowTitleEdit: false,
+      showVisibilityToggle: false,
+      onPropertyChange: (key, value) => {
+        snapshot.properties[key] = value;
+        model.properties[key] = value;
+        send({
+          version: WEBVIEW_MESSAGE_VERSION,
+          type: "requestUpdateExposedComponentProperty",
+          outerComponentId,
+          sourceId,
+          innerComponentId: snapshot.id,
+          name: key,
+          value,
+        });
+      },
+    }),
+  );
+  if (!propertyDialog.open) propertyDialog.showModal();
+}
+
 function refreshOpenPropertyDialog(): void {
-  if (!propertyDialog.open || !activePropertyComponentId) return;
-  const component = state.components.find((entry) => entry.id === activePropertyComponentId);
-  if (!component) {
-    propertyDialog.close();
+  if (!propertyDialog.open || !activePropertyTarget) return;
+  const target = activePropertyTarget;
+  if (target.kind === "project") {
+    const component = state.components.find((entry) => entry.id === target.componentId);
+    if (!component) {
+      propertyDialog.close();
+      return;
+    }
+    openPropertyDialog(component);
     return;
   }
-  openPropertyDialog(component);
+  openExposedInternalPropertyDialog(
+    target.outerComponentId,
+    target.sourceId,
+    target.snapshot,
+  );
 }
 
 type ContextMenuIconKind = "copy" | "cut" | "remove" | "properties" | "rotateCw" | "rotateCcw" | "rotate180" | "flipHorizontal" | "flipVertical";
 
 type ContextMenuItem =
   | { kind: "separator" }
-  | { label: string; onClick: () => void; disabled?: boolean; icon?: ContextMenuIconKind; shortcut?: string };
+  | { label: string; onClick: () => void; disabled?: boolean; icon?: ContextMenuIconKind; shortcut?: string; checked?: boolean }
+  /** Submenu (ex: um item por componente exposto da instância, cada um com suas próprias ações --
+   * ver `buildExposedComponentMenuItems`) -- aberto ao passar o mouse, mesmo princípio de qualquer
+   * menu nativo de SO. `icon`/`disabled` reaproveitados do item de ação pra não duplicar campos. */
+  | { label: string; items: ContextMenuItem[]; icon?: ContextMenuIconKind; disabled?: boolean };
 
 function renderContextMenuIcon(kind?: ContextMenuIconKind): HTMLSpanElement {
   const wrapper = document.createElement("span");
@@ -589,28 +803,71 @@ function renderContextMenuIcon(kind?: ContextMenuIconKind): HTMLSpanElement {
   return wrapper;
 }
 
-function showContextMenu(event: MouseEvent, items: ContextMenuItem[]): void {
-  event.preventDefault();
-  event.stopPropagation();
-  contextMenu.innerHTML = "";
-  if (items.length === 0 || items.every((item) => "kind" in item && item.kind === "separator")) {
-    hideContextMenu();
-    return;
-  }
+function isSubmenuItem(item: ContextMenuItem): item is Extract<ContextMenuItem, { items: ContextMenuItem[] }> {
+  return "items" in item;
+}
 
+/** Preenche `container` (menu de topo OU um popup de submenu) com `items` -- recursivo: um item
+ * `items` (sem `onClick`) vira um submenu aberto ao passar o mouse, com seu PRÓPRIO popup
+ * `context-menu--submenu` anexado a `document.body` (não dentro do pai, pra não ficar limitado pela
+ * largura/altura dele) e posicionado à direita do botão que o abriu. */
+function renderContextMenuItems(container: HTMLElement, items: ContextMenuItem[]): void {
+  container.innerHTML = "";
   for (const item of items) {
     if ("kind" in item && item.kind === "separator") {
       const separator = document.createElement("div");
       separator.className = "context-menu__separator";
-      contextMenu.appendChild(separator);
+      container.appendChild(separator);
       continue;
     }
-    const action = item as Extract<ContextMenuItem, { label: string }>;
+    if (isSubmenuItem(item)) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "context-menu__item";
+      button.disabled = item.disabled ?? false;
+      button.appendChild(renderContextMenuIcon(item.icon));
+      const label = document.createElement("span");
+      label.className = "context-menu__label";
+      label.textContent = item.label;
+      const arrow = document.createElement("span");
+      arrow.className = "context-menu__submenu-arrow";
+      arrow.textContent = "▶";
+      button.append(label, arrow);
+
+      const submenu = document.createElement("div");
+      submenu.className = "context-menu context-menu--submenu";
+      submenu.hidden = true;
+      document.body.appendChild(submenu);
+      renderContextMenuItems(submenu, item.items);
+      openSubmenuPopups.push(submenu);
+
+      let closeTimer: ReturnType<typeof setTimeout> | undefined;
+      const openSubmenu = (): void => {
+        if (closeTimer) clearTimeout(closeTimer);
+        for (const other of openSubmenuPopups) if (other !== submenu) other.hidden = true;
+        const rect = button.getBoundingClientRect();
+        submenu.hidden = false;
+        submenu.style.left = `${rect.right}px`;
+        submenu.style.top = `${rect.top}px`;
+      };
+      const scheduleClose = (): void => {
+        closeTimer = setTimeout(() => { submenu.hidden = true; }, 250);
+      };
+      button.addEventListener("mouseenter", openSubmenu);
+      button.addEventListener("mouseleave", scheduleClose);
+      submenu.addEventListener("mouseenter", () => { if (closeTimer) clearTimeout(closeTimer); });
+      submenu.addEventListener("mouseleave", scheduleClose);
+      container.appendChild(button);
+      continue;
+    }
+    const action = item as Extract<ContextMenuItem, { label: string; onClick: () => void }>;
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "context-menu__item";
+    button.className = `context-menu__item${action.checked !== undefined ? " context-menu__item--checkable" : ""}${action.checked ? " context-menu__item--checked" : ""}`;
     button.disabled = action.disabled ?? false;
-    const icon = renderContextMenuIcon(action.icon);
+    const icon = action.checked !== undefined
+      ? (() => { const check = document.createElement("span"); check.className = "context-menu__check"; check.textContent = action.checked ? "✓" : ""; return check; })()
+      : renderContextMenuIcon(action.icon);
     const label = document.createElement("span");
     label.className = "context-menu__label";
     label.textContent = action.label;
@@ -622,8 +879,18 @@ function showContextMenu(event: MouseEvent, items: ContextMenuItem[]): void {
       hideContextMenu();
       action.onClick();
     });
-    contextMenu.appendChild(button);
+    container.appendChild(button);
   }
+}
+
+function showContextMenu(event: MouseEvent, items: ContextMenuItem[]): void {
+  event.preventDefault();
+  event.stopPropagation();
+  if (items.length === 0 || items.every((item) => "kind" in item && item.kind === "separator")) {
+    hideContextMenu();
+    return;
+  }
+  renderContextMenuItems(contextMenu, items);
 
   contextMenu.hidden = false;
   contextMenu.style.left = `${event.clientX}px`;
@@ -952,6 +1219,18 @@ function render(): void {
     canvasContent.appendChild(renderComponent(component));
   }
 
+  for (const component of state.components.filter((entry) => {
+    if (entry.hidden) return false;
+    const catalogEntry = state.catalog.find((item) => item.typeId === entry.typeId);
+    return catalogEntry?.registeredSourceKind === "subcircuit-file";
+  })) {
+    ensureBoardOverlayData(component);
+  }
+
+  for (const component of state.components.filter((entry) => !entry.hidden && entry.properties.boardModeEnabled)) {
+    for (const overlayEl of renderBoardOverlaysFor(component)) canvasContent.appendChild(overlayEl);
+  }
+
   for (const component of state.components.filter((entry) => !entry.hidden && isVisibleInCurrentMode(entry))) {
     const embedsOwnIdLabel = component.typeId === "connectors.tunnel" &&
       typeof component.properties.name === "string" &&
@@ -1231,6 +1510,14 @@ function rotatePoint(local: Point, box: { width: number; height: number }, rotat
     default:
       return local;
   }
+}
+
+function svgBodyTransform(box: { width: number; height: number }, rotation: 0 | 90 | 180 | 270, flipH: boolean, flipV: boolean): string {
+  const cx = box.width / 2;
+  const cy = box.height / 2;
+  const scaleX = flipH ? -1 : 1;
+  const scaleY = flipV ? -1 : 1;
+  return `translate(${cx} ${cy}) rotate(${rotation}) scale(${scaleX} ${scaleY}) translate(${-cx} ${-cy})`;
 }
 
 function componentPinLocalPosition(component: WebviewComponentModel, pinIndex: number): Point {
@@ -2528,8 +2815,14 @@ function rotateSelectedComponents(steps: 1 | -1 | 2): void {
  * identificados pelo mesmo `pinId`, então fios já conectados não precisam de nenhum ajuste no
  * Core (mesma lógica de `applyRotation`: puramente visual). */
 function applyFlip(component: WebviewComponentModel, axis: "horizontal" | "vertical"): void {
-  if (axis === "horizontal") component.flipH = !component.flipH;
-  else component.flipV = !component.flipV;
+  const flipsLocalHorizontal = component.rotation === 0 || component.rotation === 180;
+  if (axis === "horizontal") {
+    if (flipsLocalHorizontal) component.flipH = !component.flipH;
+    else component.flipV = !component.flipV;
+  } else {
+    if (flipsLocalHorizontal) component.flipV = !component.flipV;
+    else component.flipH = !component.flipH;
+  }
   send({
     version: WEBVIEW_MESSAGE_VERSION,
     type: "requestFlipComponent",
@@ -2573,11 +2866,13 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
   const svg = document.createElementNS(SVG_NS, "svg");
   svg.classList.add("component__symbol");
   svg.setAttribute("viewBox", `0 0 ${box.width} ${box.height}`);
+  const bodyGroup = document.createElementNS(SVG_NS, "g");
+  bodyGroup.classList.add("component__symbol-body");
   // CSS aplica da direita pra esquerda: scale (flip) primeiro, rotate depois -- mesma ordem usada
   // em flipPoint/rotatePoint pra calcular posição de pino, ver componentPinLocalPosition.
   const scaleX = component.flipH ? -1 : 1;
   const scaleY = component.flipV ? -1 : 1;
-  svg.style.transform = `rotate(${component.rotation}deg) scale(${scaleX}, ${scaleY})`;
+  bodyGroup.setAttribute("transform", svgBodyTransform(box, component.rotation, Boolean(component.flipH), Boolean(component.flipV)));
   if (isPushButton) {
     svg.classList.add("component__symbol--push");
     if (component.properties.closed === true) svg.classList.add("component__symbol--push-pressed");
@@ -2591,12 +2886,13 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
     if (component.properties.out === true) svg.classList.add("component__symbol--fixed-volt-on");
   }
   const symbolProperties = runtimeSymbolProperties(component);
-  svg.innerHTML = packageSymbolSvg(component.typeId, symbolProperties) ?? catalogEntry?.symbolSvg ?? componentSymbolSvg(component.typeId, symbolProperties);
-  const tunnelLabel = svg.querySelector<SVGTextElement>(".tunnel-name");
+  bodyGroup.innerHTML = packageSymbolSvg(component.typeId, symbolProperties) ?? catalogEntry?.symbolSvg ?? componentSymbolSvg(component.typeId, symbolProperties);
+  svg.appendChild(bodyGroup);
+  const tunnelLabel = bodyGroup.querySelector<SVGTextElement>(".tunnel-name");
   if (tunnelLabel && (component.flipH || component.flipV)) {
     tunnelLabel.style.transformBox = "fill-box";
     tunnelLabel.style.transformOrigin = "center";
-    tunnelLabel.style.transform = `scale(${component.flipH ? -1 : 1}, ${component.flipV ? -1 : 1})`;
+    tunnelLabel.style.transform = `scale(${scaleX}, ${scaleY})`;
   }
 
   if (isComponentSelected(component.id)) {
@@ -2753,6 +3049,7 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
     render();
     const selectedComponents = getSelectedComponents();
     const isGroup = selectedComponents.length > 1;
+    const isInternalSubcircuitComponent = Boolean(symbolAuthoringContext && symbolAuthoringContext.kind === "subcircuit-file" && !isSymbolAuthoringTypeId(component.typeId));
     // Mesma entrada do botão "✎" da paleta (`palette.ts`) -- só que a partir de uma INSTÂNCIA já
     // colocada no circuito, igual ao "Open Subcircuit" do SimulIDE no menu de botão direito. Só
     // aparece pra typeId registrado (tem `registeredSourceId` -- built-ins de verdade não têm
@@ -2761,13 +3058,36 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
     const propertyMenuItems: ContextMenuItem[] = isGroup
       ? []
       : [{ label: t("properties"), icon: "properties", onClick: () => openPropertyDialog(component) }];
+    const internalSubcircuitMenuItems: ContextMenuItem[] = !isGroup && isInternalSubcircuitComponent
+      ? [{
+          label: t("exposed"),
+          checked: component.exposed === true,
+          onClick: () => {
+            component.exposed = component.exposed !== true;
+            persistState();
+            render();
+            refreshOpenPropertyDialog();
+          },
+        }]
+      : [];
     const symbolMenuItems: ContextMenuItem[] = !isGroup && sourceId
       ? [{
           label: catalogEntry?.registeredSourceKind === "subcircuit-file" ? t("openSubcircuit") : t("editSymbol"),
           onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestEditSymbol", sourceId }),
         }]
       : [];
-    const mcuMenuItems: ContextMenuItem[] = !isGroup && isMcuHostComponent(component)
+    // Menu da instância do subcircuito no circuito principal: ações da própria instância ficam
+    // aqui; os componentes internos expostos aparecem em submenus separados.
+    const isSubcircuitWithPackage = !isGroup && Boolean(sourceId) && catalogEntry?.registeredSourceKind === "subcircuit-file";
+    const subcircuitPackageMenuItems: ContextMenuItem[] = isSubcircuitWithPackage
+      ? [
+          { label: t("loadPackage"), onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestLoadPackage", sourceId: sourceId! }) },
+          { label: t("savePackage"), onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestSavePackage", sourceId: sourceId! }) },
+          { kind: "separator" },
+        ]
+      : [];
+    const exposedSubmenuItems: ContextMenuItem[] = !isGroup && isSubcircuitWithPackage ? buildExposedComponentMenuItems(component) : [];
+    const mcuMenuItems: ContextMenuItem[] = !isGroup && !isSubcircuitWithPackage && isMcuHostComponent(component)
       ? [
           { kind: "separator" },
           { label: t("loadFirmware"), onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestChooseMcuFirmware", componentId: component.id }) },
@@ -2778,10 +3098,14 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
         ]
       : [];
     const menuItems: ContextMenuItem[] = [
+      ...exposedSubmenuItems,
+      ...(exposedSubmenuItems.length > 0 ? [{ kind: "separator" } satisfies ContextMenuItem] : []),
+      ...subcircuitPackageMenuItems,
       { label: t("copy"), icon: "copy", shortcut: "Ctrl+C", onClick: () => copySelectedItems() },
       { label: t("cut"), icon: "cut", shortcut: "Ctrl+X", onClick: () => cutSelectedItems() },
       { label: isGroup ? t("deleteSelectedItems") : t("remove"), icon: "remove", shortcut: "Del", onClick: () => deleteSelectedItems() },
       ...propertyMenuItems,
+      ...internalSubcircuitMenuItems,
       { kind: "separator" },
       { label: t("rotateCw"), icon: "rotateCw", shortcut: "Ctrl+R", onClick: () => rotateSelectedComponents(1) },
       { label: t("rotateCcw"), icon: "rotateCcw", shortcut: "Ctrl+Shift+R", onClick: () => rotateSelectedComponents(-1) },
@@ -2862,6 +3186,13 @@ interface PropertyField {
   max?: number;
   step?: number;
   options?: { value: string; label: string }[];
+}
+
+interface PropertySheetOptions {
+  titleText?: string;
+  allowTitleEdit?: boolean;
+  showVisibilityToggle?: boolean;
+  onPropertyChange?: (key: string, value: string | number | boolean) => void;
 }
 
 function humanizePropertyName(name: string): string {
@@ -2987,6 +3318,34 @@ function isMcuHostComponent(component: WebviewComponentModel): boolean {
   return entry?.mcuHost === true || component.typeId === "espressif.esp32";
 }
 
+function isMcuHostTypeId(typeId: string): boolean {
+  const entry = state.catalog.find((catalogEntry) => catalogEntry.typeId === typeId);
+  return entry?.mcuHost === true || typeId === "espressif.esp32";
+}
+
+function buildExposedComponentMenuItems(component: WebviewComponentModel): ContextMenuItem[] {
+  const sourceId = state.catalog.find((entry) => entry.typeId === component.typeId)?.registeredSourceId;
+  if (!sourceId) return [];
+  ensureBoardOverlayData(component);
+  const items = boardOverlayDataByComponentId.get(component.id) ?? [];
+  return items
+    .filter((item) => item.exposed)
+    .map((item) => {
+      const actions: ContextMenuItem[] = [];
+      if (isMcuHostTypeId(item.typeId)) {
+        actions.push(
+          { label: t("loadFirmware"), onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestChooseExposedMcuFirmware", outerComponentId: component.id, innerComponentId: item.id }) },
+          { label: t("reloadFirmware"), onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestReloadExposedMcuFirmware", outerComponentId: component.id, innerComponentId: item.id }) },
+          { label: `${t("openSerialMonitor")} USART1`, onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestOpenExposedMcuSerialMonitor", outerComponentId: component.id, innerComponentId: item.id, usartIndex: 0 }) },
+          { label: `${t("openSerialMonitor")} USART2`, onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestOpenExposedMcuSerialMonitor", outerComponentId: component.id, innerComponentId: item.id, usartIndex: 1 }) },
+          { label: `${t("openSerialMonitor")} USART3`, onClick: () => send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestOpenExposedMcuSerialMonitor", outerComponentId: component.id, innerComponentId: item.id, usartIndex: 2 }) },
+        );
+      }
+      actions.push({ label: t("properties"), icon: "properties", onClick: () => openExposedInternalPropertyDialog(component.id, sourceId, item) });
+      return { label: item.label, items: actions } satisfies ContextMenuItem;
+    });
+}
+
 function augmentRuntimePropertyFields(component: WebviewComponentModel, fields: PropertyField[]): PropertyField[] {
   if (!isMcuHostComponent(component)) return fields;
   const existingKeys = new Set(fields.map((field) => field.key));
@@ -3084,7 +3443,17 @@ function groupFields(fields: PropertyField[]): Map<string, PropertyField[]> {
   return groups;
 }
 
-function renderPropertyField(component: WebviewComponentModel, field: PropertyField): HTMLElement {
+function renderPropertyField(component: WebviewComponentModel, field: PropertyField, options: PropertySheetOptions = {}): HTMLElement {
+  const applyChange = (value: string | number | boolean): void => {
+    component.properties[field.key] = value;
+    if (options.onPropertyChange) {
+      options.onPropertyChange(field.key, value);
+    } else {
+      send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateProperty", componentId: component.id, name: field.key, value });
+      persistState();
+    }
+    refreshOpenPropertyDialog();
+  };
   if (field.kind === "boolean") {
     const row = document.createElement("label");
     row.className = "property-sheet__check-row";
@@ -3093,12 +3462,9 @@ function renderPropertyField(component: WebviewComponentModel, field: PropertyFi
     input.checked = Boolean(field.value);
     input.disabled = field.readonly ?? false;
     input.addEventListener("change", () => {
-      component.properties[field.key] = input.checked;
-      send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateProperty", componentId: component.id, name: field.key, value: input.checked });
+      applyChange(input.checked);
       if (component.typeId === "switches.switch" && field.key === "closed") updateRenderedSwitchState(component);
       if (component.typeId === "sources.fixed_volt" && field.key === "out") updateRenderedFixedVoltState(component);
-      persistState();
-      refreshOpenPropertyDialog();
     });
     const text = document.createElement("span");
     text.textContent = field.label;
@@ -3124,10 +3490,7 @@ function renderPropertyField(component: WebviewComponentModel, field: PropertyFi
       select.appendChild(optionEl);
     }
     select.addEventListener("change", () => {
-      component.properties[field.key] = select.value;
-      send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateProperty", componentId: component.id, name: field.key, value: select.value });
-      persistState();
-      refreshOpenPropertyDialog();
+      applyChange(select.value);
     });
     row.append(caption, select);
     return row;
@@ -3146,10 +3509,7 @@ function renderPropertyField(component: WebviewComponentModel, field: PropertyFi
   if (!input.readOnly) {
     input.addEventListener("change", () => {
       const value = field.kind === "number" ? Number(input.value) : input.value;
-      component.properties[field.key] = value;
-      send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestUpdateProperty", componentId: component.id, name: field.key, value });
-      persistState();
-      refreshOpenPropertyDialog();
+      applyChange(value);
     });
   }
   row.append(caption, input);
@@ -3160,7 +3520,7 @@ function componentTypeLabel(component: WebviewComponentModel): string {
   return state.catalog.find((entry) => entry.typeId === component.typeId)?.label ?? component.typeId;
 }
 
-function renderPropertySheet(component: WebviewComponentModel): HTMLElement {
+function renderPropertySheet(component: WebviewComponentModel, options: PropertySheetOptions = {}): HTMLElement {
   const shell = document.createElement("section");
   shell.className = "property-sheet";
 
@@ -3168,7 +3528,7 @@ function renderPropertySheet(component: WebviewComponentModel): HTMLElement {
   titleBar.className = "property-sheet__titlebar";
   const uid = document.createElement("div");
   uid.className = "property-sheet__uid";
-  uid.textContent = `${t("uid")}: ${component.label}`;
+  uid.textContent = options.titleText ?? `${t("uid")}: ${component.label}`;
   const closeButton = document.createElement("button");
   closeButton.type = "button";
   closeButton.className = "property-sheet__window-close";
@@ -3204,24 +3564,28 @@ function renderPropertySheet(component: WebviewComponentModel): HTMLElement {
     refreshOpenPropertyDialog();
   });
   showLabel.append(showText, showCheckbox);
-  toolbarActions.append(helpButton, showLabel);
+  toolbarActions.append(helpButton);
+  if (options.showVisibilityToggle !== false) toolbarActions.append(showLabel);
   toolbar.append(typeText, toolbarActions);
 
-  const titleRow = document.createElement("label");
-  titleRow.className = "property-sheet__title-row";
-  const titleCaption = document.createElement("span");
-  titleCaption.textContent = t("title");
-  const titleInput = document.createElement("input");
-  titleInput.type = "text";
-  titleInput.value = component.label;
-  titleInput.addEventListener("change", () => {
-    component.label = titleInput.value.trim() || component.label;
-    send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestRenameComponent", componentId: component.id, label: component.label });
-    persistState();
-    render();
-    refreshOpenPropertyDialog();
-  });
-  titleRow.append(titleCaption, titleInput);
+  let titleRow: HTMLElement | undefined;
+  if (options.allowTitleEdit !== false) {
+    titleRow = document.createElement("label");
+    titleRow.className = "property-sheet__title-row";
+    const titleCaption = document.createElement("span");
+    titleCaption.textContent = t("title");
+    const titleInput = document.createElement("input");
+    titleInput.type = "text";
+    titleInput.value = component.label;
+    titleInput.addEventListener("change", () => {
+      component.label = titleInput.value.trim() || component.label;
+      send({ version: WEBVIEW_MESSAGE_VERSION, type: "requestRenameComponent", componentId: component.id, label: component.label });
+      persistState();
+      render();
+      refreshOpenPropertyDialog();
+    });
+    titleRow.append(titleCaption, titleInput);
+  }
 
   const usesSchema = Boolean(state.catalog.find((entry) => entry.typeId === component.typeId)?.propertySchema?.length);
   const groups = groupFields(resolvePropertyFields(component));
@@ -3262,13 +3626,15 @@ function renderPropertySheet(component: WebviewComponentModel): HTMLElement {
       empty.textContent = t("noProperties");
       fieldset.appendChild(empty);
     } else {
-      for (const field of fields) fieldset.appendChild(renderPropertyField(component, field));
+      for (const field of fields) fieldset.appendChild(renderPropertyField(component, field, options));
     }
     pages.appendChild(fieldset);
   };
 
   renderPage();
-  shell.append(titleBar, toolbar, titleRow, tabs, pages);
+  shell.append(titleBar, toolbar);
+  if (titleRow) shell.append(titleRow);
+  shell.append(tabs, pages);
   return shell;
 }
 
@@ -3316,6 +3682,11 @@ window.addEventListener("message", (event: MessageEvent<HostToWebviewMessage>) =
     if (message.oscope) realScopeHistoryByComponentId.set(message.componentId, message.oscope.channels);
     if (message.logic) realLogicHistoryByComponentId.set(message.componentId, message.logic);
     renderInstrumentPopups();
+  }
+
+  if (message.type === "boardOverlayData") {
+    boardOverlayDataByComponentId.set(message.componentId, message.items);
+    render();
   }
 
   if (message.type === "wireVoltages") {

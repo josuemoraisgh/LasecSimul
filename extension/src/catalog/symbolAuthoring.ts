@@ -15,7 +15,7 @@
  * linha: perde precisão de ângulo não-cardinal, ver `snapRotation`).
  */
 import { componentBox } from "../ui/webview/componentSymbols";
-import { PackageBackground, PackageDescriptor, PackagePin, PackageShape, WebviewComponentModel, WebviewWireModel } from "../ui/webview/model";
+import { PackageBackground, PackageDescriptor, PackagePin, PackageShape, SIMULIDE_PACKAGE_GRID_UNIT, WebviewComponentModel, WebviewWireModel } from "../ui/webview/model";
 
 /** Posição/orientação visual de um componente -- mesmo formato de `ProjectComponent.visual`
  * (`project/ProjectTypes.ts`), reaproveitado pro circuito INTERNO de um subcircuito
@@ -34,6 +34,10 @@ export interface InternalComponentSeed {
   properties: Record<string, unknown>;
   visual?: VisualPosition;
   boardVisual?: VisualPosition;
+  /** "Selecione os Componentes expostos" -- ver `subpackage.cpp::mainComp()`/`isMainComp` no
+   * SimulIDE real. Controla quem aparece no overlay de Modo Placa do circuito PRINCIPAL (não a
+   * sessão de autoria). Ausente == `false` (não exposto por padrão). */
+  exposed?: boolean;
 }
 
 export interface InternalWireSeed {
@@ -75,8 +79,23 @@ function snapRotation(angleDegrees: number): 0 | 90 | 180 | 270 {
 export function seedSymbolAuthoringComponents(pkg: PackageDescriptor, originX = 140, originY = 140): WebviewComponentModel[] {
   const components: WebviewComponentModel[] = [];
 
-  const packageProperties: Record<string, string | number | boolean> = { width: pkg.width, height: pkg.height, border: pkg.border ?? true };
+  const displayWidth = typeof pkg.schematicWidth === "number" && pkg.schematicWidth > 0 ? pkg.schematicWidth : pkg.width;
+  const displayHeight = typeof pkg.schematicHeight === "number" && pkg.schematicHeight > 0 ? pkg.schematicHeight : pkg.height;
+  const scaleX = pkg.width > 0 ? displayWidth / pkg.width : 1;
+  const scaleY = pkg.height > 0 ? displayHeight / pkg.height : 1;
+  const usesSimulideGrid = pkg.schematicWidth !== undefined || pkg.schematicHeight !== undefined;
+  const packageProperties: Record<string, string | number | boolean> = {
+    width: usesSimulideGrid ? displayWidth / SIMULIDE_PACKAGE_GRID_UNIT : pkg.width,
+    height: usesSimulideGrid ? displayHeight / SIMULIDE_PACKAGE_GRID_UNIT : pkg.height,
+    border: pkg.border ?? true,
+  };
+  if (usesSimulideGrid) {
+    packageProperties.__ui_packageUnit = "simulide-grid";
+    packageProperties.__ui_nativeWidth = pkg.width;
+    packageProperties.__ui_nativeHeight = pkg.height;
+  }
   if (pkg.background?.kind === "color" && pkg.background.value) packageProperties.backgroundColor = pkg.background.value;
+  if (pkg.pinLabelColor) packageProperties.pinLabelColor = pkg.pinLabelColor;
   // `properties` só aceita string/number/boolean (sem objeto aninhado) -- a foto em base64 cabe
   // direto como string, só achatada num nome próprio em vez de `background.data`. Sem isto, a sessão
   // de autoria (componente `other.package`, ver componentSymbols.ts) nunca via a imagem real (só
@@ -86,16 +105,17 @@ export function seedSymbolAuthoringComponents(pkg: PackageDescriptor, originX = 
   components.push(baseComponent(nextComponentId("package", 0), "other.package", originX, originY, 0, packageProperties));
 
   (pkg.shapes ?? []).forEach((shape, index) => {
-    const component = seedShapeComponent(shape, index, originX, originY);
+    const component = seedShapeComponent(shape, index, originX, originY, scaleX, scaleY);
     if (component) components.push(component);
   });
 
   pkg.pins.forEach((pin, index) => {
-    const properties: Record<string, string | number | boolean> = { pinId: pin.id, length: pin.length };
+    const pinScale = pin.angle === 90 || pin.angle === 270 ? scaleY : scaleX;
+    const properties: Record<string, string | number | boolean> = { pinId: pin.id, length: pin.length * pinScale };
     const box = componentBox("other.package_pin", properties);
     const pinComponentId = nextComponentId("pin", index);
-    components.push(baseComponent(pinComponentId, "other.package_pin", originX + pin.x - box.width / 2, originY + pin.y - box.height / 2, snapRotation(pin.angle), properties));
-    components.push(seedPinLabelComponent(pin, pinComponentId, index, originX, originY));
+    components.push(baseComponent(pinComponentId, "other.package_pin", originX + pin.x * scaleX - box.width / 2, originY + pin.y * scaleY - box.height / 2, snapRotation(pin.angle), properties));
+    components.push(seedPinLabelComponent(pin, pinComponentId, index, originX, originY, scaleX, scaleY));
   });
 
   return components;
@@ -145,6 +165,7 @@ export function seedSubcircuitInternalComponents(components: InternalComponentSe
       flipV: visual.flipV,
       pins: [],
       properties: component.properties as Record<string, string | number | boolean>,
+      exposed: component.exposed === true,
     };
     if (component.boardVisual) {
       model.boardX = Math.round(component.boardVisual.x);
@@ -185,6 +206,7 @@ export function compileSubcircuitInternalComponents(components: WebviewComponent
         typeId: component.typeId,
         properties: component.properties,
         visual: { x: component.x, y: component.y, rotation: component.rotation, flipH: component.flipH, flipV: component.flipV },
+        exposed: component.exposed === true,
       };
       if (component.boardX !== undefined && component.boardY !== undefined) {
         seed.boardVisual = { x: component.boardX, y: component.boardY, rotation: component.boardRotation ?? 0, flipH: component.boardFlipH, flipV: component.boardFlipV };
@@ -202,7 +224,7 @@ export function compileSubcircuitInternalComponents(components: WebviewComponent
  * do pino, igual ao SimulIDE real. Sem `pin.labelX`/`labelY` (package nunca editado assim antes),
  * cai na MESMA posição padrão que o renderizador de leitura sempre calculou (ponta do lead + 9
  * unidades na direção do `angle`) -- abrir e salvar sem mover nada reproduz o `package` idêntico. */
-function seedPinLabelComponent(pin: PackagePin, pinComponentId: string, index: number, originX: number, originY: number): WebviewComponentModel {
+function seedPinLabelComponent(pin: PackagePin, pinComponentId: string, index: number, originX: number, originY: number, scaleX = 1, scaleY = 1): WebviewComponentModel {
   const rad = (pin.angle * Math.PI) / 180;
   const tipX = pin.x + Math.cos(rad) * pin.length;
   const tipY = pin.y + Math.sin(rad) * pin.length;
@@ -211,8 +233,8 @@ function seedPinLabelComponent(pin: PackagePin, pinComponentId: string, index: n
   // um `PackageShape` kind "text" em `packageShapeSvg`, por isso o mesmo ajuste de `fontSize/3` pra
   // converter baseline -> centro da caixa (ver `seedShapeComponent`/`case "text"` abaixo e a
   // compilação espelhada em `compileSymbolAuthoringComponents`).
-  const labelX = pin.labelX ?? tipX + Math.cos(rad) * 9;
-  const labelY = pin.labelY ?? tipY + Math.sin(rad) * 9;
+  const labelX = (pin.labelX ?? tipX + Math.cos(rad) * 9) * scaleX;
+  const labelY = (pin.labelY ?? tipY + Math.sin(rad) * 9) * scaleY;
   const text = pin.label ?? pin.id;
   const fontSize = 7;
   const properties: Record<string, string | number | boolean> = { text, fontSize, color: "#1f2937", linkedPinComponentId: pinComponentId };
@@ -222,23 +244,23 @@ function seedPinLabelComponent(pin: PackagePin, pinComponentId: string, index: n
   return baseComponent(nextComponentId("pin-label", index), "graphics.text", originX + centerX - box.width / 2, originY + centerY - box.height / 2, 0, properties);
 }
 
-function seedShapeComponent(shape: PackageShape, index: number, originX: number, originY: number): WebviewComponentModel | undefined {
+function seedShapeComponent(shape: PackageShape, index: number, originX: number, originY: number, scaleX = 1, scaleY = 1): WebviewComponentModel | undefined {
   switch (shape.kind) {
     case "rect": {
-      const properties = { width: shape.w ?? 0, height: shape.h ?? 0, stroke: shape.stroke ?? "#94a3b8", fill: shape.fill ?? "none", strokeWidth: shape.strokeWidth ?? 1 };
-      return baseComponent(nextComponentId("shape", index), "graphics.rectangle", originX + (shape.x ?? 0), originY + (shape.y ?? 0), 0, properties);
+      const properties = { width: (shape.w ?? 0) * scaleX, height: (shape.h ?? 0) * scaleY, stroke: shape.stroke ?? "#94a3b8", fill: shape.fill ?? "none", strokeWidth: shape.strokeWidth ?? 1 };
+      return baseComponent(nextComponentId("shape", index), "graphics.rectangle", originX + (shape.x ?? 0) * scaleX, originY + (shape.y ?? 0) * scaleY, 0, properties);
     }
     case "ellipse": {
-      const rx = shape.rx ?? 0;
-      const ry = shape.ry ?? 0;
+      const rx = (shape.rx ?? 0) * scaleX;
+      const ry = (shape.ry ?? 0) * scaleY;
       const properties = { width: rx * 2, height: ry * 2, stroke: shape.stroke ?? "#94a3b8", fill: shape.fill ?? "none" };
-      return baseComponent(nextComponentId("shape", index), "graphics.ellipse", originX + (shape.cx ?? 0) - rx, originY + (shape.cy ?? 0) - ry, 0, properties);
+      return baseComponent(nextComponentId("shape", index), "graphics.ellipse", originX + (shape.cx ?? 0) * scaleX - rx, originY + (shape.cy ?? 0) * scaleY - ry, 0, properties);
     }
     case "line": {
-      const x1 = shape.x1 ?? 0;
-      const y1 = shape.y1 ?? 0;
-      const x2 = shape.x2 ?? 0;
-      const y2 = shape.y2 ?? 0;
+      const x1 = (shape.x1 ?? 0) * scaleX;
+      const y1 = (shape.y1 ?? 0) * scaleY;
+      const x2 = (shape.x2 ?? 0) * scaleX;
+      const y2 = (shape.y2 ?? 0) * scaleY;
       const midX = (x1 + x2) / 2;
       const midY = (y1 + y2) / 2;
       const length = Math.hypot(x2 - x1, y2 - y1);
@@ -251,8 +273,8 @@ function seedShapeComponent(shape: PackageShape, index: number, originX: number,
       const fontSize = shape.fontSize ?? 11;
       const properties = { text: shape.value ?? "", fontSize, color: shape.color ?? "#1f2937" };
       const box = componentBox("graphics.text", properties);
-      const centerX = shape.x ?? 0;
-      const centerY = (shape.y ?? 0) - fontSize / 3;
+      const centerX = (shape.x ?? 0) * scaleX;
+      const centerY = (shape.y ?? 0) * scaleY - fontSize / 3;
       return baseComponent(nextComponentId("shape", index), "graphics.text", originX + centerX - box.width / 2, originY + centerY - box.height / 2, 0, properties);
     }
     default:
@@ -280,8 +302,17 @@ export function compileSymbolAuthoringComponents(components: WebviewComponentMod
   const packageComponent = packages[0]!;
   const originX = packageComponent.x;
   const originY = packageComponent.y;
-  const width = typeof packageComponent.properties.width === "number" ? packageComponent.properties.width : 80;
-  const height = typeof packageComponent.properties.height === "number" ? packageComponent.properties.height : 60;
+  const editedWidth = typeof packageComponent.properties.width === "number" ? packageComponent.properties.width : 80;
+  const editedHeight = typeof packageComponent.properties.height === "number" ? packageComponent.properties.height : 60;
+  const usesSimulideGrid = packageComponent.properties.__ui_packageUnit === "simulide-grid";
+  const schematicWidth = usesSimulideGrid ? editedWidth * SIMULIDE_PACKAGE_GRID_UNIT : undefined;
+  const schematicHeight = usesSimulideGrid ? editedHeight * SIMULIDE_PACKAGE_GRID_UNIT : undefined;
+  const width = typeof packageComponent.properties.__ui_nativeWidth === "number" && packageComponent.properties.__ui_nativeWidth > 0 ? packageComponent.properties.__ui_nativeWidth : (schematicWidth ?? editedWidth);
+  const height = typeof packageComponent.properties.__ui_nativeHeight === "number" && packageComponent.properties.__ui_nativeHeight > 0 ? packageComponent.properties.__ui_nativeHeight : (schematicHeight ?? editedHeight);
+  const scaleX = schematicWidth !== undefined && schematicWidth > 0 && width > 0 ? schematicWidth / width : 1;
+  const scaleY = schematicHeight !== undefined && schematicHeight > 0 && height > 0 ? schematicHeight / height : 1;
+  const toNativeX = (value: number): number => value / scaleX;
+  const toNativeY = (value: number): number => value / scaleY;
   const border = packageComponent.properties.border !== false;
   const backgroundColor = typeof packageComponent.properties.backgroundColor === "string" ? packageComponent.properties.backgroundColor : undefined;
   const background: PackageBackground | undefined = backgroundColor
@@ -308,11 +339,13 @@ export function compileSymbolAuthoringComponents(components: WebviewComponentMod
   for (const component of components) {
     if (component.typeId === "other.package") continue;
     if (component.typeId === "graphics.text" && typeof component.properties.linkedPinComponentId === "string") continue;
-    const localX = component.x - originX;
-    const localY = component.y - originY;
+    const localDisplayX = component.x - originX;
+    const localDisplayY = component.y - originY;
+    const localX = toNativeX(localDisplayX);
+    const localY = toNativeY(localDisplayY);
     if (component.typeId === "graphics.rectangle") {
-      const w = typeof component.properties.width === "number" ? component.properties.width : 0;
-      const h = typeof component.properties.height === "number" ? component.properties.height : 0;
+      const w = toNativeX(typeof component.properties.width === "number" ? component.properties.width : 0);
+      const h = toNativeY(typeof component.properties.height === "number" ? component.properties.height : 0);
       shapes.push({
         kind: "rect",
         x: localX,
@@ -324,8 +357,8 @@ export function compileSymbolAuthoringComponents(components: WebviewComponentMod
         strokeWidth: typeof component.properties.strokeWidth === "number" ? component.properties.strokeWidth : undefined,
       });
     } else if (component.typeId === "graphics.ellipse") {
-      const w = typeof component.properties.width === "number" ? component.properties.width : 0;
-      const h = typeof component.properties.height === "number" ? component.properties.height : 0;
+      const w = toNativeX(typeof component.properties.width === "number" ? component.properties.width : 0);
+      const h = toNativeY(typeof component.properties.height === "number" ? component.properties.height : 0);
       shapes.push({
         kind: "ellipse",
         cx: localX + w / 2,
@@ -337,9 +370,9 @@ export function compileSymbolAuthoringComponents(components: WebviewComponentMod
       });
     } else if (component.typeId === "graphics.line") {
       const box = componentBox("graphics.line", component.properties);
-      const length = typeof component.properties.length === "number" ? component.properties.length : 40;
-      const midX = localX + box.width / 2;
-      const midY = localY + box.height / 2;
+      const length = toNativeX(typeof component.properties.length === "number" ? component.properties.length : 40);
+      const midX = toNativeX(localDisplayX + box.width / 2);
+      const midY = toNativeY(localDisplayY + box.height / 2);
       const rad = (component.rotation * Math.PI) / 180;
       const dx = (Math.cos(rad) * length) / 2;
       const dy = (Math.sin(rad) * length) / 2;
@@ -356,8 +389,8 @@ export function compileSymbolAuthoringComponents(components: WebviewComponentMod
       const fontSize = typeof component.properties.fontSize === "number" ? component.properties.fontSize : 11;
       shapes.push({
         kind: "text",
-        x: localX + box.width / 2,
-        y: localY + box.height / 2 + fontSize / 3,
+        x: toNativeX(localDisplayX + box.width / 2),
+        y: toNativeY(localDisplayY + box.height / 2 + fontSize / 3),
         value: typeof component.properties.text === "string" ? component.properties.text : "",
         fontSize,
         color: typeof component.properties.color === "string" ? component.properties.color : undefined,
@@ -367,22 +400,23 @@ export function compileSymbolAuthoringComponents(components: WebviewComponentMod
       const id = typeof component.properties.pinId === "string" && component.properties.pinId.trim() ? component.properties.pinId.trim() : `pin${pins.length + 1}`;
       const pin: PackagePin = {
         id,
-        x: localX + box.width / 2,
-        y: localY + box.height / 2,
+        x: toNativeX(localDisplayX + box.width / 2),
+        y: toNativeY(localDisplayY + box.height / 2),
         angle: component.rotation,
-        length: typeof component.properties.length === "number" ? component.properties.length : 8,
+        length: (typeof component.properties.length === "number" ? component.properties.length : 8) / (component.rotation === 90 || component.rotation === 270 ? scaleY : scaleX),
       };
       const linkedLabel = linkedLabelByPinComponentId.get(component.id);
       if (linkedLabel) {
         const labelBox = componentBox("graphics.text", linkedLabel.properties);
         const labelFontSize = typeof linkedLabel.properties.fontSize === "number" ? linkedLabel.properties.fontSize : 7;
         pin.label = typeof linkedLabel.properties.text === "string" ? linkedLabel.properties.text : undefined;
-        pin.labelX = linkedLabel.x - originX + labelBox.width / 2;
-        pin.labelY = linkedLabel.y - originY + labelBox.height / 2 + labelFontSize / 3;
+        pin.labelX = toNativeX(linkedLabel.x - originX + labelBox.width / 2);
+        pin.labelY = toNativeY(linkedLabel.y - originY + labelBox.height / 2 + labelFontSize / 3);
       }
       pins.push(pin);
     }
   }
 
-  return { package: { width, height, border, background, shapes, pins } };
+  const pinLabelColor = typeof packageComponent.properties.pinLabelColor === "string" ? packageComponent.properties.pinLabelColor : undefined;
+  return { package: { width, height, schematicWidth, schematicHeight, border, background, shapes, pins, pinLabelColor } };
 }

@@ -287,6 +287,14 @@ html, body {
   cursor: pointer;
 }
 
+/** Overlay de Modo Placa (botão EN/BOOT etc. desenhados sobre a foto do package no circuito
+ * PRINCIPAL, ver `main.ts::renderBoardOverlaysFor`) -- não arrastável (não faz parte do circuito do
+ * usuário, só espelha um componente interno do subcircuito), sempre por cima da foto da placa. */
+.component--board-overlay {
+  cursor: pointer;
+  z-index: 5;
+}
+
 .component__symbol--push .push-actuator-bar,
 .component__symbol--push .push-body {
   transition: transform 80ms ease-out, fill 80ms ease-out, stroke 80ms ease-out;
@@ -580,6 +588,28 @@ html, body {
   box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
 }
 
+/** "Selecione os Componentes expostos" -- precisa de mais largura que `.property-dialog` (rótulos
+ * combinados, ex: "Resistor (pullup_en) -- Modo Placa?", estouravam os 322px fixos e forçavam
+ * scroll horizontal que cortava o título/as primeiras linhas, ver bug relatado 2026-06-30). Mesmo
+ * resto do visual (`.property-sheet`/`.property-sheet__check-row`), só a largura muda. */
+.exposed-components-dialog {
+  width: 480px;
+  min-width: 480px;
+  max-width: min(480px, 92vw);
+  padding: 0;
+  border: 1px solid #b8b8b8;
+  border-radius: 2px;
+  background: #eeeeee;
+  color: #000;
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+  box-sizing: border-box;
+  overflow-x: hidden;
+}
+
+.exposed-components-dialog::backdrop {
+  background: transparent;
+}
+
 .property-dialog::backdrop {
   background: transparent;
 }
@@ -589,16 +619,19 @@ html, body {
   gap: 8px;
   padding: 0 12px 12px;
   font-size: 12px;
+  min-width: 0;
 }
 
 .property-sheet__titlebar {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   margin: 0 -12px;
   padding: 4px 8px;
   border-bottom: 1px solid #d2d2d2;
   background: linear-gradient(#f8f8f8, #ebebeb);
+  min-width: 0;
 }
 
 .property-sheet__uid {
@@ -630,6 +663,7 @@ html, body {
 
 .property-sheet__actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
 }
@@ -707,26 +741,60 @@ html, body {
   padding: 14px 12px;
 }
 
+/** Usada só pelo dialog "Selecione os Componentes expostos" (lista pode ter 30+ itens) -- não
+ * aplicada globalmente a `.property-sheet__pages` pra não mudar o comportamento de diálogos
+ * existentes que já cabem sem rolagem. Sem isto, os últimos itens da lista ficavam cortados/
+ * inacessíveis (pedido original seções 6/7). */
+.property-sheet__pages--scrollable {
+  max-height: 60vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
 .property-sheet__group {
   margin: 0;
   padding: 0;
   border: none;
   display: grid;
   gap: 11px;
+  min-width: 0;
 }
 
 .property-sheet__check-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 4px 8px;
   font-size: 11px;
   color: #000;
+  /** Sem isto, um `<span>` de texto longo sem quebra força a linha (item flex, `min-width: auto`
+   * por padrão) a manter sua largura mínima de conteúdo, empurrando a largura de TODO o diálogo
+   * além do que `max-width` permite -- mesma classe de bug CSS que causou o corte horizontal do
+   * dialog "Selecione os Componentes expostos" (rótulos combinados, ex: "Resistor (pullup_en) --
+   * Modo Placa?"). */
+  min-width: 0;
 }
 
 .property-sheet__check-row input {
   width: 14px;
   height: 14px;
   margin: 0;
+  flex-shrink: 0;
+}
+
+.property-sheet__check-label {
+  min-width: 0;
+  overflow-wrap: break-word;
+  white-space: normal;
+}
+
+.property-sheet__check-hint {
+  min-width: 0;
+  overflow-wrap: break-word;
+  white-space: normal;
+  font-size: 10px;
+  font-style: italic;
+  color: #8a8a8a;
 }
 
 .property-sheet__empty {
@@ -743,6 +811,19 @@ html, body {
   border: 1px solid #b8b8b8;
   background: #fbfbfb;
   box-shadow: 0 8px 18px rgba(0, 0, 0, 0.24);
+}
+
+/** Submenu (ex: um item por componente exposto da instância) -- popup PRÓPRIO, anexado fora do menu
+ * pai (ver `main.ts::renderContextMenuItems`), aberto ao passar o mouse no item que o contém.
+ * `min-width` menor que o menu de topo -- normalmente só tem 2-4 ações por componente exposto. */
+.context-menu--submenu {
+  min-width: 220px;
+}
+
+.context-menu__submenu-arrow {
+  text-align: right;
+  color: #888;
+  font-size: 10px;
 }
 
 .context-menu__item {
@@ -798,6 +879,16 @@ html, body {
 .context-menu__item:disabled {
   color: #8d8d8d;
   cursor: default;
+}
+
+.context-menu__check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  color: #2a7a3b;
+  font-weight: 700;
 }
 
 /* Janela "Expande" do osciloscópio/analisador lógico -- igual ao OscWidget/LogicAnalyzerWidget

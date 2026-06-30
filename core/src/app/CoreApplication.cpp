@@ -995,6 +995,59 @@ OutgoingResponse handleMessage(const IncomingMessage& msg, SimulationSession& se
         }
         return resp;
     }
+    if (msg.type == "setSubcircuitChildProperty") {
+        // Overlay de Modo Placa no circuito principal -- edita uma propriedade de um componente
+        // DENTRO de um subcircuito (ex: "button_en") endereçando por id local em vez do índice Core
+        // (que a Extension não conhece pra filhos de subcircuito, só pra instâncias de topo, ver
+        // `coreInstanceIdByComponentId` em extension.ts). Mesmo formato de resposta de "setProperty".
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const uint32_t outerInstanceId = static_cast<uint32_t>(std::stoul(payload.value("instanceId", std::string{"0"})));
+            const std::string localId = payload.value("localId", std::string{});
+            const std::string name = payload.value("name", std::string{});
+            const std::optional<uint32_t> childIndex = session.findSubcircuitChildByLocalId(outerInstanceId, localId);
+            if (!childIndex) {
+                resp.ok = false;
+                resp.error = "setSubcircuitChildProperty: componente interno '" + localId + "' não encontrado";
+                return resp;
+            }
+            const std::optional<std::string> error =
+                session.setProperty(*childIndex, name, jsonToPropertyValue(payload.at("value")));
+            if (error) {
+                const ParsedPropertyError parsed = parsePropertyError(*error);
+                resp.ok = false;
+                resp.error = parsed.message;
+                resp.payloadJson = nlohmann::json{{"errorCode", parsed.code}}.dump();
+            } else {
+                resp.ok = true;
+            }
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("setSubcircuitChildProperty falhou: ") + e.what();
+        }
+        return resp;
+    }
+    if (msg.type == "getSubcircuitChildInstanceId") {
+        try {
+            const nlohmann::json payload =
+                msg.payloadJson.empty() ? nlohmann::json::object() : nlohmann::json::parse(msg.payloadJson);
+            const uint32_t outerInstanceId = static_cast<uint32_t>(std::stoul(payload.value("instanceId", std::string{"0"})));
+            const std::string localId = payload.value("localId", std::string{});
+            const std::optional<uint32_t> childIndex = session.findSubcircuitChildByLocalId(outerInstanceId, localId);
+            if (!childIndex) {
+                resp.ok = false;
+                resp.error = "getSubcircuitChildInstanceId: componente interno '" + localId + "' não encontrado";
+                return resp;
+            }
+            resp.ok = true;
+            resp.payloadJson = nlohmann::json{{"instanceId", std::to_string(*childIndex)}}.dump();
+        } catch (const std::exception& e) {
+            resp.ok = false;
+            resp.error = std::string("getSubcircuitChildInstanceId falhou: ") + e.what();
+        }
+        return resp;
+    }
     if (msg.type == "removeComponent") {
         try {
             const nlohmann::json payload =

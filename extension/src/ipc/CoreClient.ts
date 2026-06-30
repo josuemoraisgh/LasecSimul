@@ -113,6 +113,21 @@ export class CoreClient {
     return { requiresRestart: Boolean(resp?.requiresRestart) };
   }
 
+  /** Edita uma propriedade de um componente DENTRO de um subcircuito, endereçando por id local
+   * (ex: "button_en") em vez do índice Core -- usado pelo overlay de Modo Placa no circuito
+   * principal, ver `core/src/app/CoreApplication.cpp::"setSubcircuitChildProperty"`. */
+  async setSubcircuitChildProperty(instanceId: string, localId: string, name: string, value: unknown): Promise<void> {
+    await this.request("setSubcircuitChildProperty", { instanceId, localId, name, value });
+  }
+
+  /** Resolve o `componentIndex` real no Core de um filho interno de subcircuito identificado pelo
+   * id local salvo no `.lssub.json` (ex: "mcu1"). Usado por ações do submenu externo de
+   * componentes expostos que precisam de um alvo direto de MCU (firmware/serial). */
+  async getSubcircuitChildInstanceId(instanceId: string, localId: string): Promise<string> {
+    const resp = await this.request("getSubcircuitChildInstanceId", { instanceId, localId });
+    return (resp as { instanceId: string }).instanceId;
+  }
+
   async connectWire(componentA: string, pinIdA: string, componentB: string, pinIdB: string): Promise<void> {
     await this.request("connectWire", { componentA, pinIdA, componentB, pinIdB });
   }

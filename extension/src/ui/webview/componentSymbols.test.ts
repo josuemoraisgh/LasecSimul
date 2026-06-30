@@ -30,6 +30,15 @@ import { PackageDescriptor } from "./model";
     assert(box.height === 40, `altura não deveria mudar (nenhum lead vertical), recebido ${box.height}`);
   });
 
+  await test("package com schematicWidth/schematicHeight escala o corpo e preserva folga de leads", () => {
+    registerPackage("test.scaled", { ...pkg, schematicWidth: 30, schematicHeight: 20 });
+    const box = componentBox("test.scaled");
+    assert(box.width === 38, `esperado largura visual 38 (30 corpo + 8 leads escalados), recebido ${box.width}`);
+    assert(box.height === 20, `esperado altura visual 20, recebido ${box.height}`);
+    const pin = pinLocalPosition("out", 0, 3, "test.scaled");
+    assert(Math.abs(pin.x - 38) < 0.001, `pino deveria escalar junto com a largura visual (38), recebido ${pin.x}`);
+  });
+
   await test("pinLocalPosition casa por id, na ponta real do lead (corpo + length na direção do angle)", () => {
     registerPackage("test.example", pkg);
     const outPos = pinLocalPosition("out", 0, 3, "test.example");
@@ -136,6 +145,9 @@ import { PackageDescriptor } from "./model";
   });
 
   registerPackage("test.example", undefined);
+  registerPackage("test.scaled", undefined);
   registerPackage("test.vertical", undefined);
+  registerPackage("test.customlabel", undefined);
+  registerPackage("test.dual", undefined);
   finish();
 })();

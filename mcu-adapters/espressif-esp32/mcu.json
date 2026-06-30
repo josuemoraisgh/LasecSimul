@@ -297,6 +297,8 @@
   "package": {
     "width": 170,
     "height": 190,
+    "schematicWidth": 88,
+    "schematicHeight": 98,
     "border": true,
     "background": {
       "kind": "color",

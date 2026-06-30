@@ -25,6 +25,24 @@ export interface InstrumentHistoryPayload {
   logic?: { timestampsNs: number[]; masks: number[] };
 }
 
+/** Um componente do circuito INTERNO de um `.lssub.json` -- alimenta o overlay de Modo Placa no
+ * circuito principal E o submenu por componente exposto no menu de contexto da instância (ver
+ * `subpackage.cpp::mainComp()`/`setBoardMode()` no SimulIDE real). `boardVisual` ausente significa
+ * que o componente nunca foi posicionado em Modo Placa (sem posição pra desenhar no overlay, cai
+ * num padrão calculado, ver `main.ts::fallbackBoardVisualPosition`). `properties` é o último valor
+ * SALVO no `.lssub.json` (não necessariamente o estado ao vivo do Core) -- suficiente pro dialog de
+ * propriedades do componente exposto, mesmo princípio de como o dialog de Propriedades de fora já
+ * lê de `WebviewComponentModel.properties` em vez de reconsultar o Core toda vez. */
+export interface InternalComponentSnapshot {
+  id: string;
+  typeId: string;
+  label: string;
+  graphical: boolean;
+  exposed: boolean;
+  boardVisual?: { x: number; y: number; rotation: 0 | 90 | 180 | 270; flipH?: boolean; flipV?: boolean };
+  properties: Record<string, string | number | boolean>;
+}
+
 export type HostToWebviewMessage =
   | { version: number; type: "init"; project: WebviewProjectState }
   | { version: number; type: "selectComponent"; componentId: string | null }
@@ -36,6 +54,10 @@ export type HostToWebviewMessage =
   /** Resposta a `requestInstrumentHistory` -- histórico REAL (tempo simulado), ver
    * `InstrumentHistoryPayload`. */
   | ({ version: number; type: "instrumentHistory" } & InstrumentHistoryPayload)
+  /** Resposta a `requestBoardOverlayData` -- alimenta o overlay de Modo Placa E o submenu por
+   * componente exposto no menu de contexto da instância (ver `main.ts::renderBoardOverlaysFor`/
+   * `buildExposedComponentMenuItems`). */
+  | { version: number; type: "boardOverlayData"; componentId: string; items: InternalComponentSnapshot[] }
   /** Vem de `lasecsimul.rotateSelectionCw`/`Ccw` (`extension.ts`), disparado por keybinding do
    * VSCode com `when: activeWebviewPanelId == 'lasecsimul.schematic'` -- sobrepõe o `Ctrl+R`/
    * `Ctrl+Shift+R` nativo do VSCode SÓ enquanto o painel está em foco (`when` reverte sozinho ao
@@ -113,6 +135,13 @@ export type WebviewToHostMessage =
   | { version: number; type: "requestChooseMcuFirmware"; componentId: string }
   | { version: number; type: "requestReloadMcuFirmware"; componentId: string }
   | { version: number; type: "requestOpenMcuSerialMonitor"; componentId: string; usartIndex: 0 | 1 | 2 }
+  /** Mesmas ações do MCU de topo, mas disparadas a partir do submenu de um componente INTERNO
+   * exposto de um subcircuito no esquemático principal. `outerComponentId` é a instância do
+   * subcircuito colocada no circuito; `innerComponentId` é o id local salvo no `.lssub.json`
+   * (ex: "mcu1"). O host resolve isso para a instância real do filho no Core. */
+  | { version: number; type: "requestChooseExposedMcuFirmware"; outerComponentId: string; innerComponentId: string }
+  | { version: number; type: "requestReloadExposedMcuFirmware"; outerComponentId: string; innerComponentId: string }
+  | { version: number; type: "requestOpenExposedMcuSerialMonitor"; outerComponentId: string; innerComponentId: string; usartIndex: 0 | 1 | 2 }
   /** Toggle "Ver: Físico / Símbolo Lógico" na barra da sessão de autoria -- descarta sem salvar a
    * vista atual (mesmo aviso já mostrado na UI, ver `main.ts::toggleLogicSymbolView`) e reabre a
    * sessão semeada a partir da OUTRA chave (`package`/`logicSymbolPackage`), preservando o circuito
@@ -134,7 +163,37 @@ export type WebviewToHostMessage =
   /** Pedido de histórico REAL pra janela "Expande" -- ver `InstrumentHistoryPayload`. Mandado ao
    * abrir a janela e a cada `componentReadout` enquanto ela continuar aberta (mesmo ritmo de
    * atualização do resto da telemetria, ~300ms, ver `pollInstrumentReadouts`). */
-  | { version: number; type: "requestInstrumentHistory"; componentId: string };
+  | { version: number; type: "requestInstrumentHistory"; componentId: string }
+  /** "Carregar pacote" do menu de contexto -- abre um arquivo JSON escolhido pelo usuário e aplica
+   * como `package` do `sourceId` (mesmo formato gravado por `requestSavePackage`). Reaproveita
+   * `editPackageSymbolCommand` internamente pra abrir a sessão de edição já com esse conteúdo. */
+  | { version: number; type: "requestLoadPackage"; sourceId: string }
+  /** "Salvar pacote" -- exporta só a chave `package` do `.lssub.json`/`device.json`/`mcu.json` do
+   * `sourceId` pra um arquivo `.pkg.json` separado escolhido pelo usuário (formato espelha
+   * `PackageDescriptor`, mesmo schema usado internamente). */
+  | { version: number; type: "requestSavePackage"; sourceId: string }
+  /** Pedido de dados pro overlay de Modo Placa E pro submenu por componente exposto do menu de
+   * contexto -- ver `boardOverlayData`. "Exposto" é marcado/desmarcado DENTRO da sessão "Abrir
+   * Subcircuito" (menu de contexto de cada componente interno, ver `main.ts::renderComponent`) e
+   * persiste via "Salvar Subcircuito" (`requestSaveSymbol`/`compileSubcircuitInternalComponents`),
+   * não por uma mensagem dedicada daqui de fora. */
+  | { version: number; type: "requestBoardOverlayData"; componentId: string; sourceId: string }
+  /** Arrastar um componente do overlay de Modo Placa direto no circuito principal -- grava
+   * `boardVisual` em `components[]` do `.lssub.json` (`sourceId`), mesmo campo que "Abrir
+   * Subcircuito"/Modo Placa interno já usa (`compileSubcircuitInternalComponents`), só que editado
+   * SEM precisar entrar na sessão de edição. `x`/`y` já vêm RELATIVOS à instância (não posição de
+   * tela). */
+  | { version: number; type: "requestUpdateBoardOverlayVisual"; sourceId: string; innerComponentId: string; x: number; y: number }
+  /** Edita uma propriedade real de um componente INTERNO exposto sem entrar em "Open Subcircuit" --
+   * usado pelo diálogo dedicado de propriedades do submenu externo. Persiste no `.lssub.json` e,
+   * se a instância já estiver expandida no Core, tenta aplicar em runtime também. */
+  | { version: number; type: "requestUpdateExposedComponentProperty"; outerComponentId: string; sourceId: string; innerComponentId: string; name: string; value: string | number | boolean }
+  /** Clique num componente do overlay de Modo Placa no circuito principal -- `outerComponentId` é a
+   * instância do subcircuito colocada no circuito do usuário, `innerComponentId` é o id LOCAL do
+   * componente dentro do `.lssub.json` (ex: "button_en"). extension.ts traduz isso pro índice real
+   * do componente Core dentro da instância expandida (ver `SimulationSession::
+   * setSubcircuitChildProperty`, novo). */
+  | { version: number; type: "requestUpdateBoardOverlayProperty"; outerComponentId: string; innerComponentId: string; name: string; value: string | number | boolean };
 
 export function isHostMessage(value: unknown): value is HostToWebviewMessage {
   return typeof value === "object" && value !== null && "type" in value && "version" in value;

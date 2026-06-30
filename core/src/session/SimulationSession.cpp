@@ -284,6 +284,7 @@ SubcircuitExpansionResult SimulationSession::expandSubcircuit(const std::string&
     std::vector<uint32_t>& children = m_subcircuitChildren[rawId];
     children = std::move(childComponentIndices);
     children.insert(children.end(), childSubcircuitIds.begin(), childSubcircuitIds.end());
+    m_subcircuitChildIndexByLocalId[rawId] = std::move(componentIndexByLocalId);
 
     expansionStack.pop_back();
     return SubcircuitExpansionResult{subcircuitInstanceId, std::move(exposedPins), primaryMcuInstanceId};
@@ -302,6 +303,16 @@ void SimulationSession::removeSubcircuitInstance(uint32_t subcircuitInstanceId) 
         }
     }
     m_subcircuitChildren.erase(it);
+    m_subcircuitChildIndexByLocalId.erase(rawId);
+}
+
+std::optional<uint32_t> SimulationSession::findSubcircuitChildByLocalId(uint32_t subcircuitInstanceId, const std::string& localId) const {
+    const uint32_t rawId = subcircuitInstanceId & ~kSubcircuitInstanceFlag;
+    const auto it = m_subcircuitChildIndexByLocalId.find(rawId);
+    if (it == m_subcircuitChildIndexByLocalId.end()) return std::nullopt;
+    const auto childIt = it->second.find(localId);
+    if (childIt == it->second.end()) return std::nullopt;
+    return childIt->second;
 }
 
 std::vector<uint8_t> SimulationSession::getComponentState(uint32_t componentIndex) const {

@@ -9,7 +9,7 @@ import { isPreApproved, isPreBlocked, resolveConsentChoice, shouldLoadLibrary, d
 import { SchematicPanel } from "./ui/panels/SchematicPanel";
 import { createInitialWebviewState } from "./ui/webview/catalog";
 import { PackageDescriptor, PackagePin, PackageShape, PropertySchemaEntry, WebviewComponentCatalogEntry, WebviewComponentModel, WebviewProjectState, WebviewWireModel } from "./ui/webview/model";
-import { ComponentReadoutValue, InstrumentHistoryPayload, SimulationStatus, WebviewToHostMessage } from "./ui/webview/messages";
+import { ComponentReadoutValue, InstrumentHistoryPayload, InternalComponentSnapshot, SimulationStatus, WebviewToHostMessage } from "./ui/webview/messages";
 import { ComponentPaletteViewProvider } from "./ui/views/ComponentPaletteViewProvider";
 import { ProjectSerializer } from "./project/ProjectSerializer";
 import { ProjectComponent, ProjectDocument, createEmptyProject } from "./project/ProjectTypes";
@@ -232,6 +232,8 @@ function sanitizePackage(value: unknown): PackageDescriptor | undefined {
   return {
     width: raw.width,
     height: raw.height,
+    schematicWidth: typeof raw.schematicWidth === "number" ? raw.schematicWidth : undefined,
+    schematicHeight: typeof raw.schematicHeight === "number" ? raw.schematicHeight : undefined,
     border: typeof raw.border === "boolean" ? raw.border : undefined,
     background,
     shapes,
@@ -625,6 +627,9 @@ function pushWireToCore(wire: WebviewWireModel): void {
 
 function isUiOnlyRuntimeProperty(component: WebviewComponentModel | undefined, name: string): boolean {
   if (name.startsWith("__ui_")) return true;
+  // "Modo Placa" da instância (overlay no circuito principal) -- sem PropertyDescriptor no Core,
+  // só controla renderização/interação na Webview (ver `toggleInstanceBoardMode`).
+  if (name === "boardModeEnabled") return true;
   if (!component || (name !== "firmwarePath" && name !== "qemuBinaryOverride")) return false;
   if (component.typeId === "espressif.esp32") return true;
   const catalogEntry = schematicState.catalog.find((entry) => entry.typeId === component.typeId);
@@ -655,6 +660,20 @@ function pushRemoveToCore(componentId: string): void {
   if (!coreId) return;
   coreClient.removeComponent(coreId).catch((err) => reportCoreWarning("remover componente", err));
   mcuTargetCoreIdByComponentId.delete(componentId);
+}
+
+/** Clique num componente do overlay de Modo Placa (botão EN/BOOT etc. desenhados sobre a foto da
+ * placa no circuito PRINCIPAL) -- `outerComponentId` é a instância do subcircuito já mapeada em
+ * `coreInstanceIdByComponentId`; `innerComponentId` é o id LOCAL do `.lssub.json` (ex:
+ * "button_en"), resolvido pelo Core via `findSubcircuitChildByLocalId` (ver
+ * `CoreApplication.cpp::"setSubcircuitChildProperty"`). */
+function updateBoardOverlayPropertyCommand(outerComponentId: string, innerComponentId: string, name: string, value: string | number | boolean): void {
+  if (!coreClient) return;
+  const coreId = coreInstanceIdByComponentId.get(outerComponentId);
+  if (!coreId) return;
+  coreClient
+    .setSubcircuitChildProperty(coreId, innerComponentId, name, value)
+    .catch((err) => reportCoreWarning(`atualizar "${innerComponentId}.${name}" (Modo Placa)`, err));
 }
 
 let voltageReadoutTimer: ReturnType<typeof setInterval> | undefined;
@@ -870,9 +889,23 @@ function resolveMcuTargetCoreId(componentId: string): string | undefined {
   return mcuTargetCoreIdByComponentId.get(componentId) ?? coreInstanceIdByComponentId.get(componentId);
 }
 
+function resolveSourceIdForComponent(componentId: string): string | undefined {
+  const component = getComponentById(componentId);
+  if (!component) return undefined;
+  return schematicState.catalog.find((entry) => entry.typeId === component.typeId)?.registeredSourceId;
+}
+
+function resolveSubcircuitChildCoreId(outerComponentId: string, innerComponentId: string): Promise<string | undefined> {
+  const outerCoreId = coreInstanceIdByComponentId.get(outerComponentId);
+  if (!coreClient || !outerCoreId) return Promise.resolve(undefined);
+  return coreClient.getSubcircuitChildInstanceId(outerCoreId, innerComponentId).catch(() => undefined);
+}
+
 function closeMcuSerialMonitor(componentId: string, usartIndex?: number): void {
   for (const [key, monitor] of mcuSerialMonitorByKey) {
-    const [currentComponentId, currentUsartIndex] = key.split(":");
+    const parts = key.split(":");
+    const currentComponentId = parts[0];
+    const currentUsartIndex = parts[parts.length - 1];
     if (currentComponentId !== componentId) continue;
     if (usartIndex !== undefined && Number(currentUsartIndex) !== usartIndex) continue;
     clearInterval(monitor.timer);
@@ -924,6 +957,34 @@ async function chooseMcuFirmwareCommand(componentId: string): Promise<void> {
   }
 }
 
+async function chooseExposedMcuFirmwareCommand(outerComponentId: string, innerComponentId: string): Promise<void> {
+  const sourceId = resolveSourceIdForComponent(outerComponentId);
+  const inner = sourceId ? gatherInternalComponentSnapshots(sourceId)?.find((entry) => entry.id === innerComponentId) : undefined;
+  const label = inner?.label ?? innerComponentId;
+  const picked = await vscode.window.showOpenDialog({
+    canSelectMany: false,
+    filters: { Firmware: ["bin", "elf", "hex"] },
+    title: `Selecionar firmware para ${label}`,
+  });
+  const selected = picked?.[0];
+  if (!selected || !sourceId) return;
+
+  const firmwarePath = selected.fsPath;
+  const qemuBinaryOverride = typeof inner?.properties.qemuBinaryOverride === "string" ? inner.properties.qemuBinaryOverride : "";
+  await updateExposedComponentPropertyCommand(outerComponentId, sourceId, innerComponentId, "firmwarePath", firmwarePath);
+
+  if (simulationStatus === "running") {
+    const targetCoreId = await resolveSubcircuitChildCoreId(outerComponentId, innerComponentId);
+    if (coreClient && targetCoreId) {
+      try {
+        await coreClient.loadMcuFirmware(targetCoreId, firmwarePath, qemuBinaryOverride || undefined);
+      } catch (err) {
+        reportCoreWarning(`carregar firmware de "${label}"`, err);
+      }
+    }
+  }
+}
+
 async function reloadMcuFirmwareCommand(componentId: string): Promise<void> {
   const component = getComponentById(componentId);
   if (!component) return;
@@ -945,6 +1006,28 @@ async function reloadMcuFirmwareCommand(componentId: string): Promise<void> {
   }
 }
 
+async function reloadExposedMcuFirmwareCommand(outerComponentId: string, innerComponentId: string): Promise<void> {
+  const sourceId = resolveSourceIdForComponent(outerComponentId);
+  const inner = sourceId ? gatherInternalComponentSnapshots(sourceId)?.find((entry) => entry.id === innerComponentId) : undefined;
+  const label = inner?.label ?? innerComponentId;
+  const firmwarePath = typeof inner?.properties.firmwarePath === "string" ? inner.properties.firmwarePath.trim() : "";
+  const qemuBinaryOverride = typeof inner?.properties.qemuBinaryOverride === "string" ? inner.properties.qemuBinaryOverride.trim() : "";
+  if (!firmwarePath) {
+    vscode.window.showWarningMessage(`Defina o firmware do componente "${label}" primeiro.`);
+    return;
+  }
+  const targetCoreId = await resolveSubcircuitChildCoreId(outerComponentId, innerComponentId);
+  if (!coreClient || !targetCoreId) {
+    vscode.window.showWarningMessage(`O MCU de "${label}" ainda nao esta disponivel no Core.`);
+    return;
+  }
+  try {
+    await coreClient.loadMcuFirmware(targetCoreId, firmwarePath, qemuBinaryOverride || undefined);
+  } catch (err) {
+    reportCoreWarning(`recarregar firmware de "${label}"`, err);
+  }
+}
+
 function openMcuSerialMonitorCommand(componentId: string, usartIndex: 0 | 1 | 2): void {
   const targetCoreId = resolveMcuTargetCoreId(componentId);
   const component = getComponentById(componentId);
@@ -961,6 +1044,51 @@ function openMcuSerialMonitorCommand(componentId: string, usartIndex: 0 | 1 | 2)
 
   const channel = vscode.window.createOutputChannel(`LasecSimul USART${usartIndex + 1} - ${component.label}`);
   channel.appendLine(`[${new Date().toLocaleString()}] Monitor serial aberto para ${component.label} (USART${usartIndex + 1}).`);
+  channel.appendLine("Observacao: por enquanto o monitor espelha os logs/saida do QEMU expostos pelo Core.");
+
+  const pollLogs = async (): Promise<void> => {
+    try {
+      const logs = await coreClient!.getMcuLogs(targetCoreId);
+      const monitor = mcuSerialMonitorByKey.get(key);
+      if (!monitor) return;
+      const delta = logs.slice(monitor.lastLength);
+      if (delta) {
+        channel.append(delta);
+        monitor.lastLength = logs.length;
+      } else if (logs.length < monitor.lastLength) {
+        channel.appendLine(`\n[${new Date().toLocaleTimeString()}] logs reiniciados`);
+        if (logs) channel.append(logs);
+        monitor.lastLength = logs.length;
+      }
+    } catch (err) {
+      channel.appendLine(`\n[erro] ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const timer = setInterval(() => void pollLogs(), 500);
+  mcuSerialMonitorByKey.set(key, { channel, timer, lastLength: 0 });
+  channel.show(true);
+  void pollLogs();
+}
+
+async function openExposedMcuSerialMonitorCommand(outerComponentId: string, innerComponentId: string, usartIndex: 0 | 1 | 2): Promise<void> {
+  const sourceId = resolveSourceIdForComponent(outerComponentId);
+  const inner = sourceId ? gatherInternalComponentSnapshots(sourceId)?.find((entry) => entry.id === innerComponentId) : undefined;
+  const label = inner?.label ?? innerComponentId;
+  const targetCoreId = await resolveSubcircuitChildCoreId(outerComponentId, innerComponentId);
+  if (!coreClient || !targetCoreId) {
+    vscode.window.showWarningMessage("Monitor serial indisponivel para este componente.");
+    return;
+  }
+  const key = `${outerComponentId}:${innerComponentId}:${usartIndex}`;
+  const existing = mcuSerialMonitorByKey.get(key);
+  if (existing) {
+    existing.channel.show(true);
+    return;
+  }
+
+  const channel = vscode.window.createOutputChannel(`LasecSimul USART${usartIndex + 1} - ${label}`);
+  channel.appendLine(`[${new Date().toLocaleString()}] Monitor serial aberto para ${label} (USART${usartIndex + 1}).`);
   channel.appendLine("Observacao: por enquanto o monitor espelha os logs/saida do QEMU expostos pelo Core.");
 
   const pollLogs = async (): Promise<void> => {
@@ -1481,11 +1609,20 @@ function handleWebviewMessage(message: WebviewToHostMessage): void {
     case "requestChooseMcuFirmware":
       void chooseMcuFirmwareCommand(message.componentId);
       return;
+    case "requestChooseExposedMcuFirmware":
+      void chooseExposedMcuFirmwareCommand(message.outerComponentId, message.innerComponentId);
+      return;
     case "requestReloadMcuFirmware":
       void reloadMcuFirmwareCommand(message.componentId);
       return;
+    case "requestReloadExposedMcuFirmware":
+      void reloadExposedMcuFirmwareCommand(message.outerComponentId, message.innerComponentId);
+      return;
     case "requestOpenMcuSerialMonitor":
       openMcuSerialMonitorCommand(message.componentId, message.usartIndex);
+      return;
+    case "requestOpenExposedMcuSerialMonitor":
+      void openExposedMcuSerialMonitorCommand(message.outerComponentId, message.innerComponentId, message.usartIndex);
       return;
     case "requestSwitchSymbolView":
       void switchSymbolViewCommand(message.filePath, message.typeId, message.kind, message.toView, message.internalComponents, message.internalWires);
@@ -1495,6 +1632,24 @@ function handleWebviewMessage(message: WebviewToHostMessage): void {
       return;
     case "requestInstrumentHistory":
       void sendInstrumentHistory(message.componentId);
+      return;
+    case "requestLoadPackage":
+      void loadPackageCommand(message.sourceId);
+      return;
+    case "requestSavePackage":
+      void savePackageCommand(message.sourceId);
+      return;
+    case "requestUpdateBoardOverlayProperty":
+      updateBoardOverlayPropertyCommand(message.outerComponentId, message.innerComponentId, message.name, message.value);
+      return;
+    case "requestBoardOverlayData":
+      void requestBoardOverlayDataCommand(message.componentId, message.sourceId);
+      return;
+    case "requestUpdateBoardOverlayVisual":
+      void updateBoardOverlayVisualCommand(message.sourceId, message.innerComponentId, message.x, message.y);
+      return;
+    case "requestUpdateExposedComponentProperty":
+      void updateExposedComponentPropertyCommand(message.outerComponentId, message.sourceId, message.innerComponentId, message.name, message.value);
       return;
   }
 }
@@ -1836,12 +1991,15 @@ function extractPackageForEditing(json: Record<string, unknown>, key: "package" 
       return {
         width: candidate.width,
         height: candidate.height,
+        schematicWidth: typeof candidate.schematicWidth === "number" ? candidate.schematicWidth : undefined,
+        schematicHeight: typeof candidate.schematicHeight === "number" ? candidate.schematicHeight : undefined,
         border: typeof candidate.border === "boolean" ? candidate.border : undefined,
         background: typeof candidate.background === "object" && candidate.background !== null
           ? (candidate.background as PackageDescriptor["background"])
           : undefined,
         shapes: Array.isArray(candidate.shapes) ? (candidate.shapes as PackageShape[]) : [],
         pins: Array.isArray(candidate.pins) ? (candidate.pins as PackagePin[]) : [],
+        pinLabelColor: typeof candidate.pinLabelColor === "string" ? candidate.pinLabelColor : undefined,
       };
     }
   }
@@ -1877,6 +2035,7 @@ function extractInternalCircuit(json: Record<string, unknown>): { components: In
       properties: typeof value.properties === "object" && value.properties !== null ? (value.properties as Record<string, unknown>) : {},
       visual: sanitizeVisualPosition(value.visual),
       boardVisual: sanitizeVisualPosition(value.boardVisual),
+      exposed: value.exposed === true,
     }))
     .filter((component) => component.id && component.typeId);
 
@@ -1900,6 +2059,203 @@ function extractInternalCircuit(json: Record<string, unknown>): { components: In
     .filter((wire) => wire.from.componentId && wire.to.componentId);
 
   return { components, wires };
+}
+
+/** Resolve um `sourceId` (`RegisteredSource.id`, igual ao usado por `editPackageSymbolCommand`) pro
+ * caminho absoluto do manifesto -- compartilhado pelos comandos de "Carregar/Salvar pacote" e
+ * "Selecione os Componentes expostos", que precisam todos do mesmo `.lssub.json`/`device.json`/
+ * `mcu.json` do item clicado. */
+function resolveSourceFilePath(ctx: vscode.ExtensionContext, sourceId: string): string | undefined {
+  const unifiedCatalog = loadUnifiedCatalog(ctx.extensionPath, currentLasecSimulLanguage());
+  const source = unifiedCatalog.registeredSources.find((value) => value.id === sourceId);
+  if (!source) {
+    vscode.window.showWarningMessage("Item registrado não encontrado no catálogo.");
+    return undefined;
+  }
+  return normalizeAbsolutePath(ctx.extensionPath, source.filePath);
+}
+
+/** "Carregar pacote" -- mesmo destino de "Abrir Subcircuito"/"Editar Símbolo" (reaproveita
+ * `editPackageSymbolCommand` tal qual), só com rótulo de menu diferente (ver `subpackage.cpp::
+ * loadPackage()` real, que também abre a edição do package ao "carregar"). */
+async function loadPackageCommand(sourceId: string): Promise<void> {
+  await editPackageSymbolCommand({ sourceId });
+}
+
+/** "Salvar pacote" -- exporta só a chave `package` do manifesto pra um arquivo separado escolhido
+ * pelo usuário (mesmo papel de `SubPackage::slotSave()` real, formato simplificado pra JSON puro
+ * em vez do `.package` binário do SimulIDE). */
+async function savePackageCommand(sourceId: string): Promise<void> {
+  if (!extensionContext) return;
+  const ctx = extensionContext;
+  const absoluteFilePath = resolveSourceFilePath(ctx, sourceId);
+  if (!absoluteFilePath || !fileExists(absoluteFilePath)) return;
+
+  let json: Record<string, unknown>;
+  try {
+    json = readJsonFile(absoluteFilePath) as Record<string, unknown>;
+  } catch (err) {
+    vscode.window.showErrorMessage(`Não foi possível ler ${absoluteFilePath}: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+
+  const pkg = json.package;
+  if (typeof pkg !== "object" || pkg === null) {
+    vscode.window.showWarningMessage("Este item não tem um \"package\" pra salvar.");
+    return;
+  }
+
+  const defaultName = `${path.basename(absoluteFilePath).replace(/\.json$/i, "")}.pkg.json`;
+  const target = await vscode.window.showSaveDialog({
+    filters: { JSON: ["json"] },
+    defaultUri: vscode.Uri.file(path.join(path.dirname(absoluteFilePath), defaultName)),
+    title: "Salvar pacote",
+  });
+  if (!target) return;
+
+  try {
+    fs.writeFileSync(target.fsPath, `${JSON.stringify(pkg, null, 2)}\n`, "utf8");
+    vscode.window.showInformationMessage(`Pacote salvo em ${target.fsPath}.`);
+  } catch (err) {
+    vscode.window.showErrorMessage(`Não foi possível salvar ${target.fsPath}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Lê o circuito interno do `.lssub.json` (`sourceId`) e monta a lista de componentes candidatos a
+ * "expostos" -- alimenta o overlay de Modo Placa E o submenu por componente exposto do menu de
+ * contexto (`main.ts::buildExposedComponentMenuItems`). "Exposto" é marcado/desmarcado DENTRO da
+ * sessão "Abrir Subcircuito" (não daqui de fora) e persistido via "Salvar Subcircuito" -- esta
+ * função só LÊ o que já foi salvo. Filtra `connectors.tunnel`/`connectors.junction` -- são fiação
+ * interna, não "componentes" expostos úteis (mesmo critério de `m_graphical` do SimulIDE: só itens
+ * com presença visual/funcional fazem sentido aqui). */
+function gatherInternalComponentSnapshots(sourceId: string): InternalComponentSnapshot[] | undefined {
+  if (!extensionContext) return undefined;
+  const absoluteFilePath = resolveSourceFilePath(extensionContext, sourceId);
+  if (!absoluteFilePath || !fileExists(absoluteFilePath)) return undefined;
+
+  let json: Record<string, unknown>;
+  try {
+    json = readJsonFile(absoluteFilePath) as Record<string, unknown>;
+  } catch (err) {
+    vscode.window.showErrorMessage(`Não foi possível ler ${absoluteFilePath}: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+
+  const internal = extractInternalCircuit(json);
+  return internal.components
+    .filter((component) => component.typeId !== "connectors.tunnel" && component.typeId !== "connectors.junction")
+    .map((component) => {
+      const catalogEntry = schematicState.catalog.find((entry) => entry.typeId === component.typeId);
+      return {
+        id: component.id,
+        typeId: component.typeId,
+        label: component.id,
+        graphical: catalogEntry?.graphical === true,
+        exposed: component.exposed === true,
+        boardVisual: component.boardVisual
+          ? { x: component.boardVisual.x, y: component.boardVisual.y, rotation: component.boardVisual.rotation ?? 0, flipH: component.boardVisual.flipH, flipV: component.boardVisual.flipV }
+          : undefined,
+        properties: component.properties as Record<string, string | number | boolean>,
+      };
+    });
+}
+
+/** Dados pro overlay de Modo Placa no circuito principal E pro submenu por componente exposto do
+ * menu de contexto -- pedido pela Webview ao renderizar qualquer instância de subcircuito (ver
+ * `main.ts::ensureBoardOverlayData`) ou quando o catálogo muda. */
+async function requestBoardOverlayDataCommand(componentId: string, sourceId: string): Promise<void> {
+  if (!schematicPanel) return;
+  const items = gatherInternalComponentSnapshots(sourceId);
+  if (!items) return;
+  schematicPanel.postMessage({ version: 1, type: "boardOverlayData", componentId, items });
+}
+
+/** Atualiza uma propriedade REAL de um componente interno exposto a partir do submenu externo do
+ * subcircuito. Persiste no `.lssub.json` e, se a instância já estiver expandida no Core, tenta
+ * aplicar em runtime também (mesmo mecanismo de `setSubcircuitChildProperty` usado pelo overlay de
+ * Modo Placa). */
+async function updateExposedComponentPropertyCommand(
+  outerComponentId: string,
+  sourceId: string | undefined,
+  innerComponentId: string,
+  name: string,
+  value: string | number | boolean,
+): Promise<void> {
+  if (!extensionContext || !sourceId) return;
+  const absoluteFilePath = resolveSourceFilePath(extensionContext, sourceId);
+  if (!absoluteFilePath || !fileExists(absoluteFilePath)) return;
+
+  let json: Record<string, unknown>;
+  try {
+    json = readJsonFile(absoluteFilePath) as Record<string, unknown>;
+  } catch (err) {
+    vscode.window.showErrorMessage(`Não foi possível ler ${absoluteFilePath}: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+
+  if (Array.isArray(json.components)) {
+    json.components = json.components.map((entry) => {
+      if (typeof entry !== "object" || entry === null) return entry;
+      const component = entry as Record<string, unknown>;
+      if (component.id !== innerComponentId) return component;
+      const properties = typeof component.properties === "object" && component.properties !== null
+        ? (component.properties as Record<string, unknown>)
+        : {};
+      return { ...component, properties: { ...properties, [name]: value } };
+    });
+  }
+
+  try {
+    fs.writeFileSync(absoluteFilePath, `${JSON.stringify(json, null, 2)}\n`, "utf8");
+  } catch (err) {
+    vscode.window.showErrorMessage(`Não foi possível salvar ${absoluteFilePath}: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+
+  updateBoardOverlayPropertyCommand(outerComponentId, innerComponentId, name, value);
+  await requestBoardOverlayDataCommand(outerComponentId, sourceId);
+}
+
+/** Arrastar um componente do overlay de Modo Placa direto no circuito principal -- grava
+ * `boardVisual` em `components[]` do `.lssub.json` (`sourceId`), preservando `rotation`/`flipH`/
+ * `flipV` já existentes (só `x`/`y` mudam; girar continua sendo coisa de "Abrir Subcircuito" por
+ * enquanto). Edição cirúrgica, mesmo padrão de `updateExposedComponentsCommand`. */
+async function updateBoardOverlayVisualCommand(sourceId: string, innerComponentId: string, x: number, y: number): Promise<void> {
+  if (!extensionContext) return;
+  const ctx = extensionContext;
+  const absoluteFilePath = resolveSourceFilePath(ctx, sourceId);
+  if (!absoluteFilePath || !fileExists(absoluteFilePath)) return;
+
+  let json: Record<string, unknown>;
+  try {
+    json = readJsonFile(absoluteFilePath) as Record<string, unknown>;
+  } catch (err) {
+    vscode.window.showErrorMessage(`Não foi possível ler ${absoluteFilePath}: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+
+  if (Array.isArray(json.components)) {
+    json.components = json.components.map((value) => {
+      if (typeof value !== "object" || value === null) return value;
+      const component = value as Record<string, unknown>;
+      if (component.id !== innerComponentId) return component;
+      const previousBoardVisual = typeof component.boardVisual === "object" && component.boardVisual !== null
+        ? (component.boardVisual as Record<string, unknown>)
+        : undefined;
+      return {
+        ...component,
+        boardVisual: { x, y, rotation: previousBoardVisual?.rotation ?? 0, flipH: previousBoardVisual?.flipH, flipV: previousBoardVisual?.flipV },
+      };
+    });
+  }
+
+  try {
+    fs.writeFileSync(absoluteFilePath, `${JSON.stringify(json, null, 2)}\n`, "utf8");
+  } catch (err) {
+    vscode.window.showErrorMessage(`Não foi possível salvar ${absoluteFilePath}: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  await refreshUnifiedCatalogState(true);
 }
 
 function detectManifestKind(absoluteFilePath: string, json: Record<string, unknown>): RegisteredItemKind {
@@ -2079,7 +2435,8 @@ async function saveSymbolCommand(
   }
 
   const packageKey = view === "logicSymbol" ? "logicSymbolPackage" : "package";
-  const existingBackground = extractPackageForEditing(json, packageKey).background;
+  const existingPackage = extractPackageForEditing(json, packageKey);
+  const existingBackground = existingPackage.background;
   const result = compileSymbolAuthoringComponents(components, existingBackground);
   if (!result.package) {
     vscode.window.showErrorMessage(result.error ?? "Não foi possível compilar o símbolo.");
@@ -2094,11 +2451,15 @@ async function saveSymbolCommand(
     }
   }
 
-  json[packageKey] = result.package;
+  json[packageKey] = {
+    ...result.package,
+    ...(result.package.schematicWidth === undefined && existingPackage.schematicWidth !== undefined ? { schematicWidth: existingPackage.schematicWidth } : {}),
+    ...(result.package.schematicHeight === undefined && existingPackage.schematicHeight !== undefined ? { schematicHeight: existingPackage.schematicHeight } : {}),
+  };
 
   if (kind === "subcircuit-file") {
     const internal = compileSubcircuitInternalComponents(components, wires);
-    json.components = internal.components.map((component) => ({ id: component.id, typeId: component.typeId, properties: component.properties, visual: component.visual, boardVisual: component.boardVisual }));
+    json.components = internal.components.map((component) => ({ id: component.id, typeId: component.typeId, properties: component.properties, visual: component.visual, boardVisual: component.boardVisual, exposed: component.exposed }));
     json.wires = internal.wires.map((wire) => ({ from: wire.from, to: wire.to, points: wire.points }));
     json.interface = compileSubcircuitInterface(components, result.package.pins);
   }

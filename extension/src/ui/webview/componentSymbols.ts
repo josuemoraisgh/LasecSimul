@@ -10,7 +10,7 @@
  * layout de pino são calculados a partir da caixa do tipo, nunca de uma constante global de tamanho.
  */
 
-import { PackageDescriptor, PackagePin, PackageShape } from "./model.js";
+import { PackageDescriptor, PackagePin, PackageShape, SIMULIDE_PACKAGE_GRID_UNIT } from "./model.js";
 
 export interface ComponentBox {
   width: number;
@@ -39,6 +39,8 @@ interface ResolvedPackage {
   height: number;
   offsetX: number;
   offsetY: number;
+  scaleX: number;
+  scaleY: number;
   pins: ResolvedPackagePin[];
   source: PackageDescriptor;
 }
@@ -66,12 +68,24 @@ function resolvePackageLayout(pkg: PackageDescriptor): ResolvedPackage {
   });
   const offsetX = -minX;
   const offsetY = -minY;
+  const nativeWidth = maxX - minX;
+  const nativeHeight = maxY - minY;
+  const scaleX = typeof pkg.schematicWidth === "number" && pkg.schematicWidth > 0 && pkg.width > 0 ? pkg.schematicWidth / pkg.width : 1;
+  const scaleY = typeof pkg.schematicHeight === "number" && pkg.schematicHeight > 0 && pkg.height > 0 ? pkg.schematicHeight / pkg.height : 1;
+  const displayWidth = nativeWidth * scaleX;
+  const displayHeight = nativeHeight * scaleY;
   return {
-    width: maxX - minX,
-    height: maxY - minY,
+    width: displayWidth,
+    height: displayHeight,
     offsetX,
     offsetY,
-    pins: tips.map((pin) => ({ ...pin, tipX: pin.tipX + offsetX, tipY: pin.tipY + offsetY })),
+    scaleX,
+    scaleY,
+    pins: tips.map((pin) => ({
+      ...pin,
+      tipX: (pin.tipX + offsetX) * scaleX,
+      tipY: (pin.tipY + offsetY) * scaleY,
+    })),
     source: pkg,
   };
 }
@@ -181,7 +195,7 @@ function packageShapeSvg(shape: PackageShape): string {
  * `resolvePackageLayout` -- quem chama envolve isto num `<g transform="translate(offsetX,offsetY)">`,
  * ver `packageBodySvg`). O círculo do terminal em si (onde o clique conecta fio) é desenhado por
  * quem chama (`main.ts::renderComponent`), na posição JÁ deslocada devolvida por `pinLocalPosition`. */
-function packagePinLeadSvg(pin: PackagePin): string {
+function packagePinLeadSvg(pin: PackagePin, labelColor = "currentColor"): string {
   const rad = (pin.angle * Math.PI) / 180;
   const tipX = pin.x + Math.cos(rad) * pin.length;
   const tipY = pin.y + Math.sin(rad) * pin.length;
@@ -198,9 +212,10 @@ function packagePinLeadSvg(pin: PackagePin): string {
   // mais sentido (ele já escolheu onde e como cabe).
   const isVerticalLead = !hasCustomLabelPos && (pin.angle === 90 || pin.angle === 270);
   const rotateAttr = isVerticalLead ? ` transform="rotate(-90 ${labelX.toFixed(1)} ${labelY.toFixed(1)})"` : "";
+  const fillAttr = labelColor === "currentColor" ? ` class="symbol-text"` : ` fill="${labelColor}"`;
   return (
     `<line x1="${pin.x}" y1="${pin.y}" x2="${tipX.toFixed(1)}" y2="${tipY.toFixed(1)}" class="symbol-stroke"/>` +
-    `<text x="${labelX.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" class="symbol-text" style="font-size:9px"${rotateAttr}>${escapeXmlText(label)}</text>`
+    `<text x="${labelX.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle"${fillAttr} style="font-size:9px"${rotateAttr}>${escapeXmlText(label)}</text>`
   );
 }
 
@@ -223,8 +238,13 @@ function packageBodySvg(resolved: ResolvedPackage): string {
     markup += `<rect x="0.5" y="0.5" width="${Math.max(0, pkg.width - 1)}" height="${Math.max(0, pkg.height - 1)}" class="symbol-stroke" fill="none"/>`;
   }
   for (const shape of pkg.shapes ?? []) markup += packageShapeSvg(shape);
-  for (const pin of pkg.pins) markup += packagePinLeadSvg(pin);
-  return `<g transform="translate(${resolved.offsetX},${resolved.offsetY})">${markup}</g>`;
+  const pinLabelColor = pkg.pinLabelColor ?? "currentColor";
+  for (const pin of pkg.pins) markup += packagePinLeadSvg(pin, pinLabelColor);
+  return (
+    `<g transform="translate(${(resolved.offsetX * resolved.scaleX).toFixed(3)},${(resolved.offsetY * resolved.scaleY).toFixed(3)})">` +
+    `<g transform="scale(${resolved.scaleX.toFixed(6)},${resolved.scaleY.toFixed(6)})">${markup}</g>` +
+    `</g>`
+  );
 }
 
 const COMPONENT_BOX: Record<string, ComponentBox> = {
@@ -314,8 +334,11 @@ const COMPONENT_BOX: Record<string, ComponentBox> = {
   "sources.controlled_source": { width: 56, height: 56 },
   "sources.battery": { width: 48, height: 36 },
   "sources.rail": { width: 54, height: 70 },
-  "espressif.esp32": { width: 160, height: 300 },
-  "subcircuits.esp32_devkitc_v4": { width: 220, height: 328 },
+  // Fallbacks usados antes do catalogo registrar o `package` real. Mantemos aqui o MESMO tamanho
+  // visual do SimulIDE para evitar "saltos" de escala no primeiro paint.
+  "espressif.esp32": { width: 88, height: 98 },
+  "subcircuits.esp32_devkitc_v4": { width: 88, height: 176 },
+  "subcircuits.esp32_wroom32": { width: 104, height: 160 },
 };
 const DEFAULT_BOX: ComponentBox = { width: 70, height: 40 };
 
@@ -342,7 +365,8 @@ function propertyDrivenBox(typeId: string, properties: Record<string, unknown> |
       const width = numberOf("width");
       const height = numberOf("height");
       if (width === undefined || height === undefined) return undefined;
-      return { width: Math.max(8, width), height: Math.max(8, height) };
+      const unit = properties.__ui_packageUnit === "simulide-grid" ? SIMULIDE_PACKAGE_GRID_UNIT : 1;
+      return { width: Math.max(8, width * unit), height: Math.max(8, height * unit) };
     }
     case "graphics.line": {
       const length = numberOf("length") ?? 40;
