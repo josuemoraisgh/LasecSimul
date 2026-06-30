@@ -173,7 +173,7 @@ html, body {
   background-image:
     linear-gradient(#d1d1c8 2px, transparent 2px),
     linear-gradient(90deg, #d1d1c8 2px, transparent 2px);
-  background-size: 23px 23px;
+  background-size: 8px 8px;
 }
 
 /** Viewport fixo (`.canvas`) nunca se move/escala; este wrapper recebe `translate()`+`scale()` via JS
@@ -301,19 +301,18 @@ html, body {
 }
 
 .component__symbol--push-pressed .push-actuator-bar {
-  transform: translateY(7px);
+  transform: translateY(4px);
 }
 
 .component__symbol--push-pressed .push-body {
-  transform: translateY(2px);
   fill: #62d67b;
   stroke: #24803a;
 }
 
 .component__symbol--switch .switch-lever {
-  transform: rotate(-35deg);
+  transform: none;
   transform-box: view-box;
-  transform-origin: 27px 22px;
+  transform-origin: 8px 8px;
   transition: transform 100ms ease-out;
 }
 
@@ -322,7 +321,7 @@ html, body {
 }
 
 .component__symbol--switch-closed .switch-lever {
-  transform: rotate(0deg);
+  transform: rotate(26.565deg);
 }
 
 .component__symbol--switch-closed .switch-body {

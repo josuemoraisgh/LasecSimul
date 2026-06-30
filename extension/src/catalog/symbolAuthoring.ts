@@ -115,7 +115,7 @@ export function seedSymbolAuthoringComponents(pkg: PackageDescriptor, originX = 
     const box = componentBox("other.package_pin", properties);
     const pinComponentId = nextComponentId("pin", index);
     components.push(baseComponent(pinComponentId, "other.package_pin", originX + pin.x * scaleX - box.width / 2, originY + pin.y * scaleY - box.height / 2, snapRotation(pin.angle), properties));
-    components.push(seedPinLabelComponent(pin, pinComponentId, index, originX, originY, scaleX, scaleY));
+    components.push(seedPinLabelComponent(pin, pinComponentId, index, originX, originY, scaleX, scaleY, pkg.pinLabelColor));
   });
 
   return components;
@@ -224,7 +224,16 @@ export function compileSubcircuitInternalComponents(components: WebviewComponent
  * do pino, igual ao SimulIDE real. Sem `pin.labelX`/`labelY` (package nunca editado assim antes),
  * cai na MESMA posição padrão que o renderizador de leitura sempre calculou (ponta do lead + 9
  * unidades na direção do `angle`) -- abrir e salvar sem mover nada reproduz o `package` idêntico. */
-function seedPinLabelComponent(pin: PackagePin, pinComponentId: string, index: number, originX: number, originY: number, scaleX = 1, scaleY = 1): WebviewComponentModel {
+function seedPinLabelComponent(
+  pin: PackagePin,
+  pinComponentId: string,
+  index: number,
+  originX: number,
+  originY: number,
+  scaleX = 1,
+  scaleY = 1,
+  labelColor = "#1f2937"
+): WebviewComponentModel {
   const rad = (pin.angle * Math.PI) / 180;
   const tipX = pin.x + Math.cos(rad) * pin.length;
   const tipY = pin.y + Math.sin(rad) * pin.length;
@@ -237,7 +246,7 @@ function seedPinLabelComponent(pin: PackagePin, pinComponentId: string, index: n
   const labelY = (pin.labelY ?? tipY + Math.sin(rad) * 9) * scaleY;
   const text = pin.label ?? pin.id;
   const fontSize = 7;
-  const properties: Record<string, string | number | boolean> = { text, fontSize, color: "#1f2937", linkedPinComponentId: pinComponentId };
+  const properties: Record<string, string | number | boolean> = { text, fontSize, color: labelColor, linkedPinComponentId: pinComponentId };
   const box = componentBox("graphics.text", properties);
   const centerX = labelX;
   const centerY = labelY - fontSize / 3;
@@ -417,6 +426,13 @@ export function compileSymbolAuthoringComponents(components: WebviewComponentMod
     }
   }
 
-  const pinLabelColor = typeof packageComponent.properties.pinLabelColor === "string" ? packageComponent.properties.pinLabelColor : undefined;
+  const linkedPinLabelColor = [...linkedLabelByPinComponentId.values()]
+    .map((component) => component.properties.color)
+    .find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  const pinLabelColor =
+    linkedPinLabelColor
+    ?? (typeof packageComponent.properties.pinLabelColor === "string" && packageComponent.properties.pinLabelColor.trim()
+      ? packageComponent.properties.pinLabelColor as string
+      : undefined);
   return { package: { width, height, schematicWidth, schematicHeight, border, background, shapes, pins, pinLabelColor } };
 }

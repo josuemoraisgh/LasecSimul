@@ -962,7 +962,7 @@ referência pendente (o problema que o SimulIDE evita ao embutir).
 
 | Campo | Equivalente no SimulIDE | Observação |
 |---|---|---|
-| `package.width`/`height` | `Package; width=...; height=...` | área do corpo, em px (não em unidades de grade — escolha deliberada, mais direto que `8 * grid` do SimulIDE) |
+| `package.width`/`height` | `Package; width=...; height=...` | área lógica do corpo em células do esquemático do SimulIDE; no canvas do LasecSimul cada unidade vale `8px` (`SIMULIDE_PACKAGE_GRID_UNIT`). Ex.: `width=11`, `height=22` ocupa `88x176px`, igual ao pacote do SimulIDE |
 | `package.border` | `border=true` | desenha contorno do retângulo do corpo |
 | `package.background.kind` | implícito por extensão de arquivo | `"svg"` (markup inline) \| `"image"` (data URI base64) \| `"color"` \| `"none"` |
 | `package.background.data` | `bckGndData` (bytes embutidos) | string — SVG inline ou data URI, nunca caminho de arquivo externo |

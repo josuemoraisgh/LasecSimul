@@ -30,6 +30,24 @@ import { PackageDescriptor } from "./model";
     assert(box.height === 40, `altura não deveria mudar (nenhum lead vertical), recebido ${box.height}`);
   });
 
+  await test("package registrado para typeId ABI/subcircuito novo não precisa de case hardcoded", () => {
+    const abiPkg: PackageDescriptor = {
+      width: 11,
+      height: 22,
+      schematicWidth: 11 * 8,
+      schematicHeight: 22 * 8,
+      pins: [{ id: "GPIO0", x: 11, y: 10, angle: 0, length: 8, label: "GPIO0" }],
+    };
+    registerPackage("community.abi-device-sem-case", abiPkg);
+
+    const box = componentBox("community.abi-device-sem-case");
+    assert(box.width === 152 && box.height === 176, `package ABI deveria vir só do JSON (88px corpo + 64px lead escalado), recebido {${box.width},${box.height}}`);
+    const pin = pinLocalPosition("GPIO0", 0, 1, "community.abi-device-sem-case");
+    assert(pin.x === 152 && pin.y === 80, `pino ABI deveria casar por id no package registrado, recebido {${pin.x},${pin.y}}`);
+
+    registerPackage("community.abi-device-sem-case", undefined);
+  });
+
   await test("package com schematicWidth/schematicHeight escala o corpo e preserva folga de leads", () => {
     registerPackage("test.scaled", { ...pkg, schematicWidth: 30, schematicHeight: 20 });
     const box = componentBox("test.scaled");
@@ -90,7 +108,7 @@ import { PackageDescriptor } from "./model";
     };
     registerPackage("test.customlabel", customLabelPkg);
     const svg = packageSymbolSvg("test.customlabel")!;
-    assert(svg.includes('x="20.0" y="20.0"'), `texto deveria ficar na posição customizada (20,20), markup: ${svg}`);
+    assert(svg.includes('x="20.0" y="28.0"'), `texto deveria ficar na posição customizada deslocada pelo viewBox (20,28), markup: ${svg}`);
     assert(!svg.includes("rotate(-90"), "com labelX/labelY explícitos, não deveria girar automaticamente (usuário já escolheu a posição)");
     registerPackage("test.customlabel", undefined);
   });
@@ -139,7 +157,7 @@ import { PackageDescriptor } from "./model";
     const longBox = componentBox("connectors.tunnel", { name: "GPIO_UART_DEBUG_LONG_NAME" });
     assert(longBox.width > shortBox.width, `nome longo deveria aumentar a largura (${shortBox.width} -> ${longBox.width})`);
     const pin = pinLocalPosition("pin", 0, 1, "connectors.tunnel", { name: "GPIO_UART_DEBUG_LONG_NAME" });
-    assert(pin.x === longBox.width - 20, `pino deveria ficar na ponta da seta (x=width-20), recebido ${pin.x} para width=${longBox.width}`);
+    assert(pin.x === longBox.width - 8, `pino deveria ficar na ponta da seta (x=width-8), recebido ${pin.x} para width=${longBox.width}`);
     const svg = componentSymbolSvg("connectors.tunnel", { name: "GPIO23" });
     assert(svg.includes("GPIO23"), "nome do tunel deveria ser desenhado dentro do simbolo");
   });

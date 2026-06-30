@@ -580,6 +580,17 @@ function getSelectedComponents(): WebviewComponentModel[] {
   return state.components.filter((component) => state.selectedComponentIds.includes(component.id));
 }
 
+function dragSelectionWithLinkedPinLabels(): WebviewComponentModel[] {
+  const selected = getSelectedComponents();
+  const byId = new Map(selected.map((component) => [component.id, component]));
+  for (const component of selected) {
+    if (component.typeId !== "other.package_pin") continue;
+    const linkedLabel = state.components.find((candidate) => candidate.typeId === "graphics.text" && candidate.properties.linkedPinComponentId === component.id);
+    if (linkedLabel && !byId.has(linkedLabel.id)) byId.set(linkedLabel.id, linkedLabel);
+  }
+  return [...byId.values()];
+}
+
 function getSelectedWires(): WebviewWireModel[] {
   return state.wires.filter((wire) => state.selectedWireIds.includes(wire.id));
 }
@@ -3136,7 +3147,7 @@ function renderComponent(component: WebviewComponentModel): HTMLElement {
     el.classList.add("dragging");
     dragStartX = event.clientX;
     dragStartY = event.clientY;
-    dragTargets = getSelectedComponents().map((selected) => ({ component: selected, startX: selected.x, startY: selected.y }));
+    dragTargets = dragSelectionWithLinkedPinLabels().map((selected) => ({ component: selected, startX: selected.x, startY: selected.y }));
     el.setPointerCapture(event.pointerId);
 
     const onMove = (moveEvent: PointerEvent) => {

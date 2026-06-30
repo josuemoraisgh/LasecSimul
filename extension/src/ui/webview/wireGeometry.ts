@@ -3,7 +3,7 @@
 
 export type Point = { x: number; y: number };
 
-export const WIRE_GRID_SIZE = 24;
+export const WIRE_GRID_SIZE = 8;
 
 export function snapToWireGrid(point: Point, gridSize: number = WIRE_GRID_SIZE): Point {
   return {

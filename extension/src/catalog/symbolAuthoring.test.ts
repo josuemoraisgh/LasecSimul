@@ -103,6 +103,22 @@ import { PackageDescriptor, WebviewWireModel } from "../ui/webview/model";
     assert(Math.abs((pin.labelX ?? 0) - 50) < 1 && Math.abs((pin.labelY ?? 0) - 40) < 1, `labelX/labelY deveriam sobreviver ao round-trip (posição arrastada pelo usuário, não a fórmula padrão), recebido {${pin.labelX},${pin.labelY}}`);
   });
 
+  await test("seed/compile: cor do rótulo de pino vem de pinLabelColor e sobrevive quando editada no graphics.text vinculado", () => {
+    const original: PackageDescriptor = {
+      width: 100,
+      height: 80,
+      pinLabelColor: "#FAFAC8",
+      pins: [{ id: "GPIO2", x: 0, y: 20, angle: 180, length: 8, label: "G2" }],
+    };
+    const components = seedSymbolAuthoringComponents(original);
+    const pinLabel = components.find((c) => c.typeId === "graphics.text" && c.properties.linkedPinComponentId)!;
+    assert(pinLabel.properties.color === "#FAFAC8", `seed deveria aplicar pinLabelColor no graphics.text vinculado, recebido ${pinLabel.properties.color}`);
+
+    pinLabel.properties.color = "#00AAFF";
+    const result = compileSymbolAuthoringComponents(components, undefined);
+    assert(result.package?.pinLabelColor === "#00AAFF", `compile deveria devolver a cor editada do rótulo de pino, recebido ${result.package?.pinLabelColor}`);
+  });
+
   await test("compile: fundo color vem do componente other.package, svg/image existente é preservado se não houver backgroundColor", () => {
     const pkg: PackageDescriptor = { width: 80, height: 60, pins: [] };
     const components = seedSymbolAuthoringComponents(pkg);

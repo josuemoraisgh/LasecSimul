@@ -7,6 +7,7 @@ import {
   samePoint,
   snapCoordinate,
   snapToWireGrid,
+  WIRE_GRID_SIZE,
 } from "./wireGeometry";
 
 (async () => {
@@ -18,8 +19,9 @@ import {
   });
 
   await test("snapToWireGrid arredonda pro grid mais próximo", () => {
-    const snapped = snapToWireGrid({ x: 10, y: 13 }, 24);
-    assert(snapped.x === 0 && snapped.y === 24, `esperado {0,24}, recebido {${snapped.x},${snapped.y}}`);
+    assert(WIRE_GRID_SIZE === 8, `grade padrão deveria seguir a unidade do SimulIDE (8), recebido ${WIRE_GRID_SIZE}`);
+    const snapped = snapToWireGrid({ x: 10, y: 13 });
+    assert(snapped.x === 8 && snapped.y === 16, `esperado {8,16}, recebido {${snapped.x},${snapped.y}}`);
   });
 
   await test("snapCoordinate arredonda escalar pro step dado", () => {

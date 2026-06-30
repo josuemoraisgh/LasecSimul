@@ -17,10 +17,16 @@ export interface ComponentBox {
   height: number;
 }
 
-const PIN_INSET = 6; // distância do pino até a borda da caixa -- evita cortar o círculo do terminal
-const LEAD_MARGIN = 18; // distância do pino até onde o corpo do símbolo começa (componentes de 2 pinos)
+const PIN_INSET = 6; // usado só nos fallbacks; símbolos alinhados ao SimulIDE declaram seus pinos exatos.
+const LEAD_MARGIN = 18;
 
 export const PIN_RADIUS = 4.5;
+const PACKAGE_PIN_LABEL_FONT_SIZE = 7;
+const COMP2PIN_BOX: ComponentBox = { width: 32, height: 16 };
+const SWITCH_BOX: ComponentBox = { width: 32, height: 24 };
+const SMALL_METER_BOX: ComponentBox = { width: 56, height: 40 };
+const TRANSISTOR_BOX: ComponentBox = { width: 32, height: 32 };
+const TRIANGLE_AMP_BOX: ComponentBox = { width: 48, height: 32 };
 
 // ── Símbolo declarativo real (Épico G) ──────────────────────────────────────────────────────────
 // Quando um typeId tem `package` (device.json/.lssub.json, ver model.ts), cada pino é desenhado na
@@ -195,14 +201,22 @@ function packageShapeSvg(shape: PackageShape): string {
  * `resolvePackageLayout` -- quem chama envolve isto num `<g transform="translate(offsetX,offsetY)">`,
  * ver `packageBodySvg`). O círculo do terminal em si (onde o clique conecta fio) é desenhado por
  * quem chama (`main.ts::renderComponent`), na posição JÁ deslocada devolvida por `pinLocalPosition`. */
-function packagePinLeadSvg(pin: PackagePin, labelColor = "currentColor"): string {
+function packagePinLeadSvg(pin: PackagePin, resolved: ResolvedPackage, labelColor = "currentColor"): string {
   const rad = (pin.angle * Math.PI) / 180;
-  const tipX = pin.x + Math.cos(rad) * pin.length;
-  const tipY = pin.y + Math.sin(rad) * pin.length;
+  const tipNativeX = pin.x + Math.cos(rad) * pin.length;
+  const tipNativeY = pin.y + Math.sin(rad) * pin.length;
   const label = pin.label ?? pin.id;
   const hasCustomLabelPos = pin.labelX !== undefined && pin.labelY !== undefined;
-  const labelX = pin.labelX ?? tipX + Math.cos(rad) * 9;
-  const labelY = pin.labelY ?? tipY + Math.sin(rad) * 9;
+  const labelNativeX = pin.labelX ?? tipNativeX + Math.cos(rad) * 9;
+  const labelNativeY = pin.labelY ?? tipNativeY + Math.sin(rad) * 9;
+  const toDisplayX = (value: number): number => (value + resolved.offsetX) * resolved.scaleX;
+  const toDisplayY = (value: number): number => (value + resolved.offsetY) * resolved.scaleY;
+  const x = toDisplayX(pin.x);
+  const y = toDisplayY(pin.y);
+  const tipX = toDisplayX(tipNativeX);
+  const tipY = toDisplayY(tipNativeY);
+  const labelX = toDisplayX(labelNativeX);
+  const labelY = toDisplayY(labelNativeY);
   // Lead vertical (topo/baixo do corpo, angle 90/270) -- texto horizontal colide com o label do
   // pino vizinho quando há muitos pinos apertados num lado só (ex: 12 pinos em 170 unidades no chip
   // ESP32 nu). Giram -90° (lê de baixo pra cima) só nesses dois ângulos -- lead horizontal
@@ -214,8 +228,8 @@ function packagePinLeadSvg(pin: PackagePin, labelColor = "currentColor"): string
   const rotateAttr = isVerticalLead ? ` transform="rotate(-90 ${labelX.toFixed(1)} ${labelY.toFixed(1)})"` : "";
   const fillAttr = labelColor === "currentColor" ? ` class="symbol-text"` : ` fill="${labelColor}"`;
   return (
-    `<line x1="${pin.x}" y1="${pin.y}" x2="${tipX.toFixed(1)}" y2="${tipY.toFixed(1)}" class="symbol-stroke"/>` +
-    `<text x="${labelX.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle"${fillAttr} style="font-size:9px"${rotateAttr}>${escapeXmlText(label)}</text>`
+    `<line x1="${x.toFixed(1)}" y1="${y.toFixed(1)}" x2="${tipX.toFixed(1)}" y2="${tipY.toFixed(1)}" class="symbol-stroke"/>` +
+    `<text x="${labelX.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle"${fillAttr} style="font-size:${PACKAGE_PIN_LABEL_FONT_SIZE}px"${rotateAttr}>${escapeXmlText(label)}</text>`
   );
 }
 
@@ -238,109 +252,159 @@ function packageBodySvg(resolved: ResolvedPackage): string {
     markup += `<rect x="0.5" y="0.5" width="${Math.max(0, pkg.width - 1)}" height="${Math.max(0, pkg.height - 1)}" class="symbol-stroke" fill="none"/>`;
   }
   for (const shape of pkg.shapes ?? []) markup += packageShapeSvg(shape);
-  const pinLabelColor = pkg.pinLabelColor ?? "currentColor";
-  for (const pin of pkg.pins) markup += packagePinLeadSvg(pin, pinLabelColor);
-  return (
+  const bodyMarkup =
     `<g transform="translate(${(resolved.offsetX * resolved.scaleX).toFixed(3)},${(resolved.offsetY * resolved.scaleY).toFixed(3)})">` +
     `<g transform="scale(${resolved.scaleX.toFixed(6)},${resolved.scaleY.toFixed(6)})">${markup}</g>` +
-    `</g>`
-  );
+    `</g>`;
+  const pinLabelColor = pkg.pinLabelColor ?? "currentColor";
+  const pinsMarkup = pkg.pins.map((pin) => packagePinLeadSvg(pin, resolved, pinLabelColor)).join("");
+  return bodyMarkup + pinsMarkup;
 }
 
-const COMPONENT_BOX: Record<string, ComponentBox> = {
-  "connectors.junction": { width: 0, height: 0 },
-  "passive.resistor": { width: 70, height: 28 },
-  "passive.variable_resistor": { width: 74, height: 34 },
-  "passive.resistor_dip": { width: 86, height: 120 },
-  "passive.potentiometer": { width: 78, height: 48 },
-  "passive.ldr": { width: 74, height: 34 },
-  "passive.thermistor": { width: 74, height: 34 },
-  "passive.rtd": { width: 74, height: 34 },
-  "passive.force_strain_gauge": { width: 74, height: 34 },
-  "passive.capacitor": { width: 56, height: 36 },
-  "passive.electrolytic_capacitor": { width: 60, height: 40 },
-  "passive.variable_capacitor": { width: 62, height: 42 },
-  "passive.inductor": { width: 80, height: 28 },
-  "passive.variable_inductor": { width: 86, height: 34 },
-  "passive.transformer": { width: 86, height: 58 },
-  "other.ground": { width: 48, height: 36 },
-  "connectors.bus": { width: 76, height: 28 },
-  "connectors.tunnel": { width: 100, height: 44 },
-  "connectors.socket": { width: 72, height: 86 },
-  "connectors.header": { width: 76, height: 36 },
-  "graphics.image": { width: 96, height: 64 },
-  "graphics.text": { width: 74, height: 28 },
-  "graphics.rectangle": { width: 96, height: 58 },
-  "graphics.ellipse": { width: 96, height: 58 },
-  "graphics.line": { width: 86, height: 32 },
-  "other.package": { width: 84, height: 66 },
-  "other.test_unit": { width: 72, height: 56 },
-  "other.dial": { width: 56, height: 56 },
-  "sources.dc_voltage": { width: 64, height: 48 },
-  "logic.button": { width: 68, height: 32 },
-  "switches.push": { width: 68, height: 54 },
-  "switches.switch": { width: 68, height: 54 },
-  "switches.switch_dip": { width: 86, height: 120 },
-  "switches.relay": { width: 86, height: 64 },
-  "switches.keypad": { width: 88, height: 88 },
-  "active.diode": { width: 70, height: 36 },
-  "active.zener": { width: 70, height: 38 },
-  "active.diac": { width: 70, height: 38 },
-  "active.scr": { width: 76, height: 48 },
-  "active.triac": { width: 76, height: 48 },
-  "active.bjt": { width: 76, height: 64 },
-  "active.mosfet": { width: 76, height: 64 },
-  "active.jfet": { width: 76, height: 64 },
-  "active.opamp": { width: 86, height: 68 },
-  "active.comparator": { width: 86, height: 68 },
-  "active.analog_mux": { width: 86, height: 68 },
-  "active.volt_regulator": { width: 82, height: 56 },
-  "outputs.led": { width: 74, height: 40 },
-  "outputs.led_rgb": { width: 78, height: 56 },
-  "outputs.led_bar": { width: 92, height: 120 },
-  "outputs.led_matrix": { width: 98, height: 120 },
-  "outputs.max72xx_matrix": { width: 92, height: 70 },
-  "outputs.ws2812": { width: 78, height: 52 },
-  "outputs.seven_segment": { width: 82, height: 98 },
-  "outputs.hd44780": { width: 128, height: 86 },
-  "outputs.aip31068_i2c": { width: 110, height: 58 },
-  "outputs.pcd8544": { width: 110, height: 72 },
-  "outputs.ks0108": { width: 140, height: 110 },
-  "outputs.ssd1306": { width: 110, height: 58 },
-  "outputs.sh1107": { width: 110, height: 58 },
-  "outputs.st7735": { width: 110, height: 72 },
-  "outputs.st7789": { width: 110, height: 72 },
-  "outputs.ili9341": { width: 110, height: 72 },
-  "outputs.gc9a01a": { width: 86, height: 86 },
-  "outputs.pcf8833": { width: 110, height: 72 },
-  "outputs.dc_motor": { width: 82, height: 54 },
-  "outputs.stepper": { width: 86, height: 74 },
-  "outputs.servo": { width: 84, height: 54 },
-  "outputs.audio_out": { width: 62, height: 48 },
-  "outputs.incandescent_lamp": { width: 72, height: 52 },
-  "instruments.voltmeter": { width: 82, height: 56 },
-
-  "meters.probe": { width: 82, height: 58 },
-  "meters.ampmeter": { width: 82, height: 56 },
-  "meters.freqmeter": { width: 116, height: 34 },
-  "meters.oscope": { width: 260, height: 180 },
-  "meters.logic_analyzer": { width: 260, height: 212 },
-
-  "sources.fixed_volt": { width: 76, height: 54 },
-  "sources.clock": { width: 44, height: 32 },
-  "sources.wave_gen": { width: 56, height: 40 },
-  "sources.voltage_source": { width: 64, height: 48 },
-  "sources.current_source": { width: 64, height: 48 },
-  "sources.controlled_source": { width: 56, height: 56 },
-  "sources.battery": { width: 48, height: 36 },
-  "sources.rail": { width: 54, height: 70 },
-  // Fallbacks usados antes do catalogo registrar o `package` real. Mantemos aqui o MESMO tamanho
-  // visual do SimulIDE para evitar "saltos" de escala no primeiro paint.
-  "espressif.esp32": { width: 88, height: 98 },
-  "subcircuits.esp32_devkitc_v4": { width: 88, height: 176 },
-  "subcircuits.esp32_wroom32": { width: 104, height: 160 },
-};
 const DEFAULT_BOX: ComponentBox = { width: 70, height: 40 };
+
+function ioComponentBox(widthCells: number, rows: number, hasLabel = true): ComponentBox {
+  // SimulIDE: src/components/iocomponent.cpp::setNumPins().
+  const heightRows = hasLabel ? rows + 1 : rows;
+  return { width: widthCells * 8 + 16, height: heightRows * 8 };
+}
+
+function logicComponentBox(widthCells: number, heightRows: number): ComponentBox {
+  // SimulIDE: several LogicComponent subclasses set m_area directly from m_width/m_height.
+  return { width: widthCells * 8 + 16, height: heightRows * 8 };
+}
+
+function builtinComponentBox(typeId: string): ComponentBox | undefined {
+  switch (typeId) {
+    case "connectors.junction": return { width: 0, height: 0 };
+    case "connectors.bus": return { width: 76, height: 28 };
+    case "connectors.tunnel": return { width: 44, height: 16 };
+    case "connectors.socket": return { width: 32, height: 64 };
+    case "connectors.header": return { width: 64, height: 16 };
+
+    case "graphics.image": return { width: 96, height: 64 };
+    case "graphics.text": return { width: 74, height: 28 };
+    case "graphics.rectangle": return { width: 96, height: 58 };
+    case "graphics.ellipse": return { width: 96, height: 58 };
+    case "graphics.line": return { width: 86, height: 32 };
+    case "other.package": return { width: 84, height: 66 };
+    case "other.package_pin": return { width: 24, height: 24 };
+    case "other.test_unit": return { width: 72, height: 56 };
+    case "other.dial": return { width: 56, height: 56 };
+    case "other.ground": return { width: 16, height: 18 }; // sources/ground.cpp
+
+    case "passive.resistor": return COMP2PIN_BOX; // comp2pin.cpp
+    case "passive.variable_resistor": return { width: 40, height: 24 };
+    case "passive.resistor_dip": return { width: 32, height: 68 };
+    case "passive.potentiometer": return { width: 40, height: 32 };
+    case "passive.ldr": return { width: 40, height: 24 };
+    case "passive.thermistor": return { width: 40, height: 24 };
+    case "passive.rtd": return { width: 40, height: 24 };
+    case "passive.force_strain_gauge": return { width: 40, height: 24 };
+    case "passive.capacitor": return COMP2PIN_BOX;
+    case "passive.electrolytic_capacitor": return { width: 36, height: 20 };
+    case "passive.variable_capacitor": return { width: 40, height: 24 };
+    case "passive.inductor": return COMP2PIN_BOX;
+    case "passive.variable_inductor": return { width: 40, height: 24 };
+    case "passive.transformer": return { width: 56, height: 64 };
+
+    case "logic.button": return COMP2PIN_BOX;
+    case "logic.buffer": return ioComponentBox(2, 1, false);
+    case "logic.and_gate": return ioComponentBox(2, 2, false);
+    case "logic.or_gate": return ioComponentBox(2, 2, false);
+    case "logic.xor_gate": return ioComponentBox(2, 2, false);
+    case "logic.counter": return logicComponentBox(3, 3); // logic/counter.cpp
+    case "logic.bin_counter": return logicComponentBox(4, 6); // logic/bincounter.cpp
+    case "logic.full_adder": return { width: 40, height: 32 }; // logic/fulladder.cpp
+    case "logic.magnitude_comp": return logicComponentBox(4, 4); // logic/magnitudecomp.cpp
+    case "logic.shift_reg": return logicComponentBox(4, 9); // logic/shiftreg.cpp
+    case "logic.function": return ioComponentBox(3, 4);
+    case "logic.flipflop_d": return logicComponentBox(3, 3); // logic/flipflopd.cpp
+    case "logic.flipflop_t": return logicComponentBox(3, 3); // logic/flipflopt.cpp
+    case "logic.flipflop_rs": return logicComponentBox(3, 4); // logic/flipfloprs.cpp
+    case "logic.flipflop_jk": return logicComponentBox(3, 4); // logic/flipflopjk.cpp
+    case "logic.latch_d": return logicComponentBox(4, 10); // logic/latchd.cpp
+    case "logic.memory": return logicComponentBox(4, 11); // logic/memory.cpp
+    case "logic.dynamic_memory": return logicComponentBox(4, 11); // logic/dynamic_memory.cpp
+    case "logic.i2c_ram": return logicComponentBox(4, 4); // logic/i2cram.cpp
+    case "logic.mux": return { width: 50, height: 114 }; // logic/mux.cpp, default channels + enables.
+    case "logic.demux": return { width: 50, height: 114 };
+    case "logic.bcd_to_dec": return logicComponentBox(4, 11); // logic/bcdtodec.cpp
+    case "logic.dec_to_bcd": return logicComponentBox(4, 10); // logic/dectobcd.cpp
+    case "logic.bcd_to_7seg": return logicComponentBox(4, 8); // logic/bcdto7s.cpp
+    case "logic.i2c_to_parallel": return logicComponentBox(4, 8); // logic/i2ctoparallel.cpp
+    case "logic.adc": return logicComponentBox(4, 9); // logic/adc.cpp
+    case "logic.dac": return logicComponentBox(4, 9); // logic/dac.cpp
+    case "logic.seven_segment_bcd": return logicComponentBox(4, 6); // logic/sevensegment_bcd.cpp
+    case "logic.lm555": return { width: 48, height: 40 }; // logic/lm555.cpp
+
+    case "switches.push": return SWITCH_BOX; // switches/push.cpp
+    case "switches.switch": return SWITCH_BOX; // switches/switch.cpp + mech_contact.cpp
+    case "switches.switch_dip": return { width: 32, height: 64 };
+    case "switches.relay": return { width: 48, height: 48 };
+    case "switches.keypad": return { width: 72, height: 72 };
+
+    case "active.diode": return COMP2PIN_BOX;
+    case "active.zener": return { width: 36, height: 20 };
+    case "active.diac": return { width: 36, height: 32 }; // active/diac.cpp
+    case "active.scr": return { width: 32, height: 24 };
+    case "active.triac": return { width: 32, height: 32 };
+    case "active.bjt": return TRANSISTOR_BOX;
+    case "active.mosfet": return TRANSISTOR_BOX;
+    case "active.jfet": return TRANSISTOR_BOX;
+    case "active.opamp": return TRIANGLE_AMP_BOX;
+    case "active.comparator": return TRIANGLE_AMP_BOX;
+    case "active.analog_mux": return { width: 48, height: 88 };
+    case "active.volt_regulator": return { width: 32, height: 24 };
+
+    case "outputs.led": return { width: 40, height: 24 };
+    case "outputs.led_rgb": return { width: 32, height: 24 };
+    case "outputs.led_bar": return { width: 32, height: 64 };
+    case "outputs.led_matrix": return { width: 72, height: 72 };
+    case "outputs.max72xx_matrix": return { width: 264, height: 88 }; // outputs/leds/max72xx_matrix.cpp
+    case "outputs.ws2812": return { width: 24, height: 24 };
+    case "outputs.seven_segment": return { width: 60, height: 60 }; // outputs/leds/sevensegment.cpp
+    case "outputs.hd44780": return { width: 210, height: 75 }; // outputs/displays/hd44780_base.cpp + pins.
+    case "outputs.aip31068_i2c": return { width: 210, height: 75 };
+    case "outputs.pcd8544": return { width: 104, height: 84 };
+    case "outputs.ks0108": return { width: 148, height: 100 };
+    case "outputs.ssd1306": return { width: 140, height: 88 };
+    case "outputs.sh1107": return { width: 88, height: 144 };
+    case "outputs.st7735": return { width: 144, height: 184 };
+    case "outputs.st7789": return { width: 252, height: 342 };
+    case "outputs.ili9341": return { width: 252, height: 342 };
+    case "outputs.gc9a01a": return { width: 252, height: 252 };
+    case "outputs.pcf8833": return { width: 144, height: 152 };
+    case "outputs.dc_motor": return { width: 80, height: 66 };
+    case "outputs.stepper": return { width: 114, height: 100 };
+    case "outputs.servo": return { width: 96, height: 80 };
+    case "outputs.audio_out": return { width: 32, height: 40 };
+    case "outputs.incandescent_lamp": return { width: 32, height: 32 };
+
+    case "instruments.voltmeter": return SMALL_METER_BOX;
+    case "meters.probe": return { width: 30, height: 16 };
+    case "meters.ampmeter": return SMALL_METER_BOX;
+    case "meters.freqmeter": return { width: 93, height: 20 };
+    case "meters.oscope": return { width: 260, height: 180 };
+    case "meters.logic_analyzer": return { width: 260, height: 212 };
+
+    case "sources.dc_voltage": return { width: 64, height: 48 };
+    case "sources.fixed_volt": return { width: 48, height: 24 };
+    case "sources.clock": return { width: 30, height: 16 };
+    case "sources.wave_gen": return { width: 48, height: 40 };
+    case "sources.voltage_source": return { width: 44, height: 32 }; // sources/voltsource.cpp
+    case "sources.current_source": return { width: 44, height: 32 }; // sources/currsource.cpp
+    case "sources.controlled_source": return { width: 48, height: 40 };
+    case "sources.battery": return COMP2PIN_BOX;
+    case "sources.rail": return { width: 24, height: 16 };
+
+    // Estes só entram se o catálogo ainda não registrou o package real.
+    case "espressif.esp32": return { width: 88, height: 98 };
+    case "subcircuits.esp32_devkitc_v4": return { width: 88, height: 176 };
+    case "subcircuits.esp32_wroom32": return { width: 104, height: 160 };
+    default: return undefined;
+  }
+}
 
 /** Caixa property-driven dos typeIds "de autoria de símbolo" (Épico G) -- `other.package`/
  * `graphics.rectangle`/`ellipse` usam `width`/`height` direto (mesmo significado de
@@ -356,8 +420,8 @@ function propertyDrivenBox(typeId: string, properties: Record<string, unknown> |
   const tunnelName = typeof properties.name === "string" ? properties.name.trim() : "";
   switch (typeId) {
     case "connectors.tunnel": {
-      const estimatedTextWidth = tunnelName ? tunnelName.length * 7.4 + 18 : 0;
-      return { width: Math.max(100, Math.ceil(estimatedTextWidth + 58)), height: 44 };
+      const estimatedTextWidth = tunnelName ? tunnelName.length * 7.4 + 12 : 20;
+      return { width: Math.max(44, Math.ceil(estimatedTextWidth + 24)), height: 16 };
     }
     case "graphics.rectangle":
     case "graphics.ellipse":
@@ -398,28 +462,7 @@ export function componentBox(typeId: string, properties?: Record<string, unknown
   if (resolved) return { width: resolved.width, height: resolved.height };
   const propertyBox = propertyDrivenBox(typeId, properties);
   if (propertyBox) return propertyBox;
-  if (typeId.startsWith("logic.")) {
-    if (
-      [
-        "logic.memory",
-        "logic.dynamic_memory",
-        "logic.mux",
-        "logic.demux",
-        "logic.bcd_to_dec",
-        "logic.dec_to_bcd",
-        "logic.bcd_to_7seg",
-        "logic.magnitude_comp",
-        "logic.shift_reg",
-        "logic.seven_segment_bcd",
-        "logic.i2c_to_parallel",
-      ].includes(typeId)
-    ) {
-      return { width: 96, height: 126 };
-    }
-    if (["logic.adc", "logic.dac", "logic.lm555", "logic.flipflop_jk"].includes(typeId)) return { width: 88, height: 86 };
-    return { width: 76, height: 56 };
-  }
-  return COMPONENT_BOX[typeId] ?? DEFAULT_BOX;
+  return builtinComponentBox(typeId) ?? DEFAULT_BOX;
 }
 
 /** Posição local (dentro da caixa do componente) do pino `pinId` (índice `pinIndex` de `pinCount`
@@ -451,35 +494,90 @@ export function pinLocalPosition(pinId: string, pinIndex: number, pinCount: numb
   }
   if (typeId === "connectors.junction") return { x: 0, y: 0 };
   const box = componentBox(typeId, properties);
+  if (typeId === "connectors.tunnel" && pinCount <= 1) {
+    return { x: box.width - 8, y: box.height / 2 };
+  }
+  switch (typeId) {
+    // SimulIDE Comp2Pin: src/components/comp2pin.cpp
+    case "passive.resistor":
+    case "passive.capacitor":
+    case "passive.inductor":
+    case "passive.variable_resistor":
+    case "passive.ldr":
+    case "passive.thermistor":
+    case "passive.rtd":
+    case "passive.force_strain_gauge":
+    case "passive.electrolytic_capacitor":
+    case "passive.variable_capacitor":
+    case "passive.variable_inductor":
+    case "sources.battery":
+    case "active.diode":
+    case "active.zener":
+      if (pinCount <= 2) return { x: pinIndex === 0 ? 0 : box.width, y: box.height / 2 };
+      break;
+    case "active.diac":
+      if (pinCount <= 2) return { x: pinIndex === 0 ? 0 : box.width, y: 16 };
+      break;
+    case "active.scr":
+      if (pinIndex === 0) return { x: 0, y: 8 };
+      if (pinIndex === 1) return { x: 32, y: 8 };
+      if (pinIndex === 2) return { x: 32, y: 16 };
+      break;
+    case "active.triac":
+      if (pinIndex === 0) return { x: 0, y: 16 };
+      if (pinIndex === 1) return { x: 32, y: 16 };
+      if (pinIndex === 2) return { x: 32, y: 28 };
+      break;
+    case "active.bjt":
+    case "active.mosfet":
+    case "active.jfet":
+      if (pinIndex === 0) return { x: 24, y: 0 };
+      if (pinIndex === 1) return { x: 24, y: 32 };
+      if (pinIndex === 2) return { x: 0, y: 16 };
+      break;
+    case "active.opamp":
+    case "active.comparator":
+      if (pinIndex === 0) return { x: 0, y: 8 };
+      if (pinIndex === 1) return { x: 0, y: 24 };
+      if (pinIndex === 2) return { x: 48, y: 16 };
+      if (pinIndex === 3) return { x: 24, y: 0 };
+      if (pinIndex === 4) return { x: 24, y: 32 };
+      break;
+    case "active.volt_regulator":
+      if (pinIndex === 0) return { x: 0, y: 8 };
+      if (pinIndex === 1) return { x: 32, y: 8 };
+      if (pinIndex === 2) return { x: 16, y: 24 };
+      break;
+    case "sources.voltage_source":
+    case "sources.current_source":
+      if (pinCount <= 1) return { x: box.width, y: box.height / 2 };
+      break;
+    case "sources.controlled_source":
+      if (pinIndex === 0) return { x: 0, y: 12 };
+      if (pinIndex === 1) return { x: 0, y: 28 };
+      if (pinIndex === 2) return { x: 24, y: 0 };
+      if (pinIndex === 3) return { x: 24, y: 40 };
+      break;
+  }
   if ((typeId === "switches.push" || typeId === "switches.switch") && pinCount <= 2) {
-    return { x: pinIndex % 2 === 0 ? PIN_INSET : box.width - PIN_INSET, y: 22 };
+    return { x: pinIndex % 2 === 0 ? 0 : box.width, y: 8 };
   }
   if (typeId === "sources.fixed_volt" && pinCount <= 1) {
-    return { x: box.width - PIN_INSET, y: box.height / 2 };
-  }
-  if (typeId === "sources.rail" && pinCount <= 1) {
-    return { x: box.width / 2, y: box.height - PIN_INSET };
-  }
-  if (typeId === "connectors.tunnel" && pinCount <= 1) {
-    // SimulIDE ancora o Tunnel na ponta da seta: o fio deve sair exatamente desse vértice, não do
-    // centro/topo do símbolo nem da extensão visual arredondada.
-    return { x: box.width - 20, y: box.height / 2 };
-  }
-  if (typeId === "meters.probe" && pinCount <= 1) {
-    // Ponta real do lead desenhado em componentSymbolSvg (line de PIN_INSET até yMid-8) -- não a
-    // posição antiga (36,14), que ficava flutuando no meio do lead, não na ponta.
-    return { x: box.width / 2, y: PIN_INSET };
-  }
-  if ((typeId === "meters.ampmeter" || typeId === "instruments.voltmeter") && pinCount >= 3) {
-    // Ponta real das "pernas" desenhadas por smallMeterDisplaySvg (rects em x=20/x=38, y=42..54) e
-    // do terminal direito (x=width-14..width, y=height/2-3..+3) -- não a posição antiga, que ficava
-    // ~4px acima da ponta visual de cada perna.
-    if (pinIndex === 0) return { x: 22.5, y: 54 };
-    if (pinIndex === 1) return { x: 40.5, y: 54 };
     return { x: box.width, y: box.height / 2 };
   }
+  if (typeId === "sources.rail" && pinCount <= 1) {
+    return { x: box.width, y: box.height / 2 };
+  }
+  if (typeId === "meters.probe" && pinCount <= 1) {
+    return { x: 0, y: box.height / 2 };
+  }
+  if ((typeId === "meters.ampmeter" || typeId === "instruments.voltmeter") && pinCount >= 3) {
+    if (pinIndex === 0) return { x: 16, y: box.height };
+    if (pinIndex === 1) return { x: 32, y: box.height };
+    return { x: box.width, y: 16 };
+  }
   if (typeId === "meters.freqmeter" && pinCount <= 1) {
-    return { x: PIN_INSET, y: box.height / 2 };
+    return { x: 0, y: box.height / 2 };
   }
   if (typeId === "meters.oscope") {
     return { x: PIN_INSET, y: 28 + pinIndex * 28 };
@@ -512,20 +610,24 @@ function zigzagPath(x1: number, x2: number, yMid: number, amplitude: number, pea
  * cada símbolo desenha só o corpo entre `LEAD_MARGIN` e `largura - LEAD_MARGIN`; o pino em si
  * (círculo) é desenhado por quem chama (renderComponent), não aqui. */
 function horizontalLeads(box: ComponentBox, yMid: number): string {
+  const pinLeft = box.width <= 40 ? 0 : PIN_INSET;
+  const pinRight = box.width <= 40 ? box.width : box.width - PIN_INSET;
+  const bodyLeft = box.width <= 40 ? 5 : LEAD_MARGIN;
+  const bodyRight = box.width <= 40 ? box.width - 5 : box.width - LEAD_MARGIN;
   return (
-    `<line x1="${PIN_INSET}" y1="${yMid}" x2="${LEAD_MARGIN}" y2="${yMid}" class="symbol-stroke"/>` +
-    `<line x1="${box.width - LEAD_MARGIN}" y1="${yMid}" x2="${box.width - PIN_INSET}" y2="${yMid}" class="symbol-stroke"/>`
+    `<line x1="${pinLeft}" y1="${yMid}" x2="${bodyLeft}" y2="${yMid}" class="symbol-stroke"/>` +
+    `<line x1="${bodyRight}" y1="${yMid}" x2="${pinRight}" y2="${yMid}" class="symbol-stroke"/>`
   );
 }
 
 function smallMeterDisplaySvg(box: ComponentBox, unit: "A" | "V", readout: number | undefined): string {
   return (
-    `<rect x="6" y="4" width="58" height="38" rx="3" class="meter-lcd"/>` +
-    `<text x="18" y="19" class="meter-lcd-value">${formatLcdNumber(readout)}</text>` +
-    `<text x="18" y="35" class="meter-lcd-unit">${unit}</text>` +
-    `<rect x="${box.width - 14}" y="${box.height / 2 - 3}" width="14" height="6" rx="3" fill="currentColor"/>` +
-    `<rect x="20" y="42" width="5" height="12" rx="2.5" fill="currentColor"/>` +
-    `<rect x="38" y="42" width="5" height="12" rx="2.5" fill="currentColor"/>`
+    `<rect x="0" y="0" width="48" height="32" rx="1" class="meter-lcd"/>` +
+    `<text x="8" y="13" class="meter-lcd-value">${formatLcdNumber(readout)}</text>` +
+    `<text x="8" y="27" class="meter-lcd-unit">${unit}</text>` +
+    `<rect x="48" y="13" width="8" height="6" rx="3" fill="currentColor"/>` +
+    `<rect x="13.5" y="32" width="5" height="8" rx="2.5" fill="currentColor"/>` +
+    `<rect x="29.5" y="32" width="5" height="8" rx="2.5" fill="currentColor"/>`
   );
 }
 
@@ -611,8 +713,9 @@ function logicAnalyzerPanelSvg(properties?: Record<string, unknown>): string {
 export function componentSymbolSvg(typeId: string, properties?: Record<string, unknown>): string {
   const box = componentBox(typeId, properties);
   const yMid = box.height / 2;
-  const x1 = LEAD_MARGIN;
-  const x2 = box.width - LEAD_MARGIN;
+  const compactTwoPin = box.width <= 40 && box.height <= 32;
+  const x1 = compactTwoPin ? 5 : LEAD_MARGIN;
+  const x2 = compactTwoPin ? box.width - 5 : box.width - LEAD_MARGIN;
   const midX = box.width / 2;
 
   const labelBox = (label: string): string =>
@@ -705,27 +808,25 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
       );
 
     case "other.ground":
-      // Pino no topo (PIN_INSET); lead desce até a linha mais larga, que fica logo abaixo do fio --
-      // as linhas vão encolhendo conforme se afastam do pino, nunca o contrário.
       return (
-        `<line x1="${midX}" y1="${PIN_INSET}" x2="${midX}" y2="14" class="symbol-stroke"/>` +
-        `<line x1="${midX - 12}" y1="14" x2="${midX + 12}" y2="14" class="symbol-stroke"/>` +
-        `<line x1="${midX - 8}" y1="20" x2="${midX + 8}" y2="20" class="symbol-stroke"/>` +
-        `<line x1="${midX - 4}" y1="26" x2="${midX + 4}" y2="26" class="symbol-stroke"/>`
+        `<line x1="8" y1="0" x2="8" y2="8" class="symbol-stroke"/>` +
+        `<line x1="1.4" y1="8" x2="14.6" y2="8" class="symbol-stroke"/>` +
+        `<line x1="3.7" y1="12" x2="12.3" y2="12" class="symbol-stroke"/>` +
+        `<line x1="6.1" y1="16" x2="9.9" y2="16" class="symbol-stroke"/>`
       );
 
     case "connectors.tunnel":
       {
         const tunnelName = typeof properties?.name === "string" ? properties.name.trim() : "";
-        const tipX = box.width - 20;
-        const bodyLeft = 6;
-        const bodyRight = tipX - 22;
+        const tipX = box.width - 8;
+        const bodyLeft = 2;
+        const bodyRight = tipX - 8;
         return (
-          `<path d="M ${bodyLeft} 8 H ${bodyRight} L ${tipX} ${yMid} L ${bodyRight} ${box.height - 8} H ${bodyLeft} Z" ` +
-          `fill="#d7d7ec" stroke="currentColor" stroke-width="6" stroke-linejoin="round"/>` +
-          `<rect x="${tipX}" y="${yMid - 6}" width="18" height="12" rx="6" fill="currentColor"/>` +
+          `<path d="M ${bodyLeft} 4 H ${bodyRight} L ${tipX} ${yMid} L ${bodyRight} ${box.height - 4} H ${bodyLeft} Z" ` +
+          `fill="#d7d7ec" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/>` +
+          `<rect x="${tipX}" y="${yMid - 3}" width="8" height="6" rx="3" fill="currentColor"/>` +
           (tunnelName
-            ? `<text x="${(bodyLeft + bodyRight) / 2}" y="${yMid + 4}" text-anchor="middle" class="tunnel-name">${escapeXmlText(tunnelName)}</text>`
+            ? `<text x="${(bodyLeft + bodyRight) / 2}" y="${yMid + 3}" text-anchor="middle" class="tunnel-name">${escapeXmlText(tunnelName)}</text>`
             : "")
         );
       }
@@ -855,26 +956,25 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
       );
 
     case "switches.push": {
-      const contactY = 22;
+      const contactY = 8;
       return (
-        `<line x1="${PIN_INSET}" y1="${contactY}" x2="17" y2="${contactY}" class="symbol-stroke"/>` +
-        `<line x1="51" y1="${contactY}" x2="${box.width - PIN_INSET}" y2="${contactY}" class="symbol-stroke"/>` +
-        `<rect x="24" y="4" width="20" height="6" rx="3" class="push-actuator-bar" fill="currentColor"/>` +
-        `<rect x="14" y="${contactY - 3}" width="16" height="6" rx="3" fill="currentColor"/>` +
-        `<rect x="38" y="${contactY - 3}" width="16" height="6" rx="3" fill="currentColor"/>` +
-        `<rect x="22" y="29" width="24" height="22" rx="4" class="push-body" fill="#dddddd" stroke="#777777" stroke-width="2"/>`
+        `<line x1="0" y1="${contactY}" x2="5" y2="${contactY}" class="symbol-stroke"/>` +
+        `<line x1="27" y1="${contactY}" x2="32" y2="${contactY}" class="symbol-stroke"/>` +
+        `<rect x="10" y="2" width="12" height="3" rx="1.5" class="push-actuator-bar" fill="currentColor"/>` +
+        `<line x1="7" y1="${contactY - 4}" x2="25" y2="${contactY - 4}" class="symbol-stroke symbol-stroke--thick push-actuator-bar"/>` +
+        `<rect x="10" y="11" width="12" height="11" rx="2" class="push-body" fill="#dddddd" stroke="#777777" stroke-width="1.5"/>`
       );
     }
 
     case "switches.switch": {
-      const contactY = 22;
+      const contactY = 8;
       return (
-        `<line x1="${PIN_INSET}" y1="${contactY}" x2="17" y2="${contactY}" class="symbol-stroke"/>` +
-        `<line x1="51" y1="${contactY}" x2="${box.width - PIN_INSET}" y2="${contactY}" class="symbol-stroke"/>` +
-        `<rect x="14" y="${contactY - 3}" width="16" height="6" rx="3" fill="currentColor"/>` +
-        `<rect x="38" y="${contactY - 3}" width="16" height="6" rx="3" fill="currentColor"/>` +
-        `<line x1="27" y1="${contactY}" x2="53" y2="${contactY}" class="symbol-stroke symbol-stroke--thick switch-lever"/>` +
-        `<rect x="22" y="29" width="24" height="22" rx="4" class="switch-body" fill="#dddddd" stroke="#777777" stroke-width="2"/>`
+        `<line x1="0" y1="${contactY}" x2="5" y2="${contactY}" class="symbol-stroke"/>` +
+        `<line x1="27" y1="${contactY}" x2="32" y2="${contactY}" class="symbol-stroke"/>` +
+        `<rect x="5" y="${contactY - 2}" width="8" height="4" rx="2" fill="currentColor"/>` +
+        `<rect x="19" y="${contactY - 2}" width="8" height="4" rx="2" fill="currentColor"/>` +
+        `<line x1="8" y1="${contactY}" x2="24" y2="0" class="symbol-stroke symbol-stroke--thick switch-lever"/>` +
+        `<rect x="10" y="11" width="12" height="11" rx="2" class="switch-body" fill="#dddddd" stroke="#777777" stroke-width="1.5"/>`
       );
     }
 
@@ -1064,17 +1164,11 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
 
     // ── Medidores (pasta "Meters" do SimulIDE) ──────────────────────────────────
     case "meters.probe": {
-      // Sonda de 1 pino: linha até o corpo + círculo, igual a Probe::paint do SimulIDE (Component::
-      // paint + drawEllipse) -- sem leads horizontais (só 1 pino, no topo). Círculo deslocado mais
-      // pra baixo (yMid menor que o centro real) pra abrir vão visível entre o terminal do pino
-      // (ponta do lead, ver pinLocalPosition) e o corpo -- box baixa demais (44px) deixava os dois
-      // quase colados, parecendo um "boneco de neve" em vez de pino+sonda.
-      const bodyY = 30;
       const showVolt = properties?.showVolt !== false;
       return (
-        `<line x1="${midX}" y1="${PIN_INSET}" x2="${midX}" y2="${bodyY - 10}" class="symbol-stroke"/>` +
-        `<circle cx="${midX}" cy="${bodyY}" r="10" class="symbol-stroke" fill="none"/>` +
-        (showVolt ? `<text x="${midX}" y="${box.height - 6}" text-anchor="middle" class="probe-voltage-label">${escapeXmlText(formatRailVoltage(symbolReadoutNumber(properties) ?? 0))} V</text>` : "")
+        `<line x1="0" y1="8" x2="10" y2="8" class="symbol-stroke"/>` +
+        `<ellipse cx="20" cy="8" rx="8" ry="8" class="symbol-stroke" fill="none"/>` +
+        (showVolt ? `<text x="32" y="6" class="probe-voltage-label">${escapeXmlText(formatRailVoltage(symbolReadoutNumber(properties) ?? 0))} V</text>` : "")
       );
     }
 
@@ -1083,9 +1177,9 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
 
     case "meters.freqmeter":
       return (
-        `<rect x="8" y="4" width="${box.width - 14}" height="${box.height - 8}" rx="2" class="meter-lcd"/>` +
-        `<rect x="0" y="${yMid - 3}" width="10" height="6" rx="3" fill="currentColor"/>` +
-        `<text x="16" y="${yMid + 5}" class="freq-lcd-value">${escapeXmlText(formatHz(symbolReadoutNumber(properties)))}</text>`
+        `<rect x="8" y="0" width="85" height="20" rx="1" class="meter-lcd"/>` +
+        `<rect x="0" y="${yMid - 3}" width="8" height="6" rx="3" fill="currentColor"/>` +
+        `<text x="13" y="${yMid + 5}" class="freq-lcd-value">${escapeXmlText(formatHz(symbolReadoutNumber(properties)))}</text>`
       );
 
     case "meters.oscope":
@@ -1099,8 +1193,9 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
     // ── Fontes (pasta "Sources" do SimulIDE) ────────────────────────────────────
     case "sources.fixed_volt": {
       return (
-        `<rect x="18" y="7" width="34" height="40" rx="6" class="fixed-volt-body" fill="#dddddd" stroke="#777777" stroke-width="4"/>` +
-        `<rect x="52" y="22" width="18" height="10" rx="5" class="fixed-volt-terminal" fill="currentColor"/>`
+        `<rect x="0" y="4" width="16" height="16" rx="2" class="fixed-volt-button" fill="#dddddd" stroke="#777777" stroke-width="1.5"/>` +
+        `<rect x="24" y="4" width="16" height="16" rx="2" class="fixed-volt-body" fill="#dddddd" stroke="#777777" stroke-width="1.5"/>` +
+        `<rect x="40" y="9" width="8" height="6" rx="3" class="fixed-volt-terminal" fill="currentColor"/>`
       );
     }
 
@@ -1162,9 +1257,9 @@ export function componentSymbolSvg(typeId: string, properties?: Record<string, u
       const voltage = typeof properties?.voltage === "number" ? properties.voltage : 5.0;
       const label = `${formatRailVoltage(voltage)} V`;
       return (
-        `<path d="M ${midX - 20} 20 L ${midX + 20} 20 L ${midX + 8} 48 L ${midX - 8} 48 Z" fill="#ffa500" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/>` +
-        `<rect x="${midX - 5}" y="46" width="10" height="18" rx="5" fill="currentColor"/>` +
-        `<text x="${midX}" y="17" text-anchor="middle" class="rail-voltage-label">${escapeXmlText(label)}</text>`
+        `<text x="6" y="6" text-anchor="middle" class="rail-voltage-label">${escapeXmlText(label)}</text>` +
+        `<path d="M 6 1.5 L 6 14.5 L 17 9 L 17 7 Z" fill="#ffa500" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>` +
+        `<rect x="16" y="5" width="8" height="6" rx="3" fill="currentColor"/>`
       );
     }
 

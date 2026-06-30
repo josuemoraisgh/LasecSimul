@@ -238,6 +238,7 @@ function sanitizePackage(value: unknown): PackageDescriptor | undefined {
     background,
     shapes,
     pins,
+    pinLabelColor: typeof raw.pinLabelColor === "string" && raw.pinLabelColor.trim() ? raw.pinLabelColor : undefined,
   };
 }
 
@@ -2006,6 +2007,62 @@ function extractPackageForEditing(json: Record<string, unknown>, key: "package" 
   return { width: 80, height: 60, border: true, shapes: [], pins: [] };
 }
 
+function extractSubcircuitInterfaceMap(json: Record<string, unknown>): Map<string, { label?: string; internalTunnel?: string }> {
+  const entries = Array.isArray(json.interface) ? json.interface : [];
+  const result = new Map<string, { label?: string; internalTunnel?: string }>();
+  for (const value of entries) {
+    if (typeof value !== "object" || value === null) continue;
+    const entry = value as Record<string, unknown>;
+    const pinId = typeof entry.pinId === "string" ? entry.pinId.trim() : "";
+    if (!pinId) continue;
+    result.set(pinId, {
+      label: typeof entry.label === "string" && entry.label.trim() ? entry.label.trim() : undefined,
+      internalTunnel: typeof entry.internalTunnel === "string" && entry.internalTunnel.trim() ? entry.internalTunnel.trim() : undefined,
+    });
+  }
+  return result;
+}
+
+function extractInternalTunnelNames(json: Record<string, unknown>): Set<string> {
+  const rawComponents = Array.isArray(json.components) ? json.components : [];
+  return new Set(
+    rawComponents
+      .filter((value): value is Record<string, unknown> => typeof value === "object" && value !== null)
+      .filter((component) => component.typeId === "connectors.tunnel")
+      .map((component) => component.properties as Record<string, unknown> | undefined)
+      .map((properties) => typeof properties?.name === "string" ? properties.name.trim() : "")
+      .filter((name) => name.length > 0)
+  );
+}
+
+function inferInternalTunnelForPin(pinId: string, tunnelNames: Set<string>, label?: string): string | undefined {
+  if (tunnelNames.has(pinId)) return pinId;
+  if (/^GND\d+$/i.test(pinId) && tunnelNames.has("GND")) return "GND";
+  const normalizedLabel = typeof label === "string" ? label.trim().toUpperCase() : "";
+  if (normalizedLabel && tunnelNames.has(normalizedLabel)) return normalizedLabel;
+  return undefined;
+}
+
+function applySubcircuitInterfaceToPackageComponents(json: Record<string, unknown>, packageComponents: WebviewComponentModel[]): WebviewComponentModel[] {
+  const interfaceByPinId = extractSubcircuitInterfaceMap(json);
+  const tunnelNames = extractInternalTunnelNames(json);
+  return packageComponents.map((component) => {
+    if (component.typeId !== "other.package_pin") return component;
+    const pinId = typeof component.properties.pinId === "string" ? component.properties.pinId.trim() : "";
+    if (!pinId) return component;
+    const current = interfaceByPinId.get(pinId);
+    const inferredTunnel = current?.internalTunnel ?? inferInternalTunnelForPin(pinId, tunnelNames, current?.label);
+    if (!inferredTunnel) return component;
+    return {
+      ...component,
+      properties: {
+        ...component.properties,
+        internalTunnel: inferredTunnel,
+      },
+    };
+  });
+}
+
 function sanitizeVisualPosition(value: unknown): VisualPosition | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const raw = value as Record<string, unknown>;
@@ -2323,7 +2380,7 @@ async function editPackageSymbolCommand(item?: { sourceId?: string; view?: "defa
 
   const view: "default" | "logicSymbol" = item?.view === "logicSymbol" && kind !== "abi-device" ? "logicSymbol" : "default";
   const packageKey = view === "logicSymbol" ? "logicSymbolPackage" : "package";
-  let components = seedSymbolAuthoringComponents(extractPackageForEditing(json, packageKey));
+  let components = applySubcircuitInterfaceToPackageComponents(json, seedSymbolAuthoringComponents(extractPackageForEditing(json, packageKey)));
   let wires: WebviewWireModel[] = [];
 
   if (kind === "subcircuit-file") {
@@ -2378,7 +2435,7 @@ async function switchSymbolViewCommand(
   }
 
   const packageKey = toView === "logicSymbol" ? "logicSymbolPackage" : "package";
-  const packageComponents = seedSymbolAuthoringComponents(extractPackageForEditing(json, packageKey));
+  const packageComponents = applySubcircuitInterfaceToPackageComponents(json, seedSymbolAuthoringComponents(extractPackageForEditing(json, packageKey)));
 
   schematicPanel?.postMessage({
     version: 1,
@@ -2398,12 +2455,19 @@ async function switchSymbolViewCommand(
  * (`compileSymbolAuthoringComponents` só sabe do `package`, nunca do circuito interno). Ordem de
  * `compiledPins` é GARANTIDA igual à de `pinComponents` (mesmo array `components`, mesmo filtro,
  * mesma ordem de iteração nos dois lugares). */
-function compileSubcircuitInterface(components: WebviewComponentModel[], compiledPins: PackagePin[]): Array<{ pinId: string; label: string; internalTunnel: string }> {
+function compileSubcircuitInterface(
+  components: WebviewComponentModel[],
+  compiledPins: PackagePin[],
+  existingInterfaceByPinId: Map<string, { label?: string; internalTunnel?: string }>
+): Array<{ pinId: string; label: string; internalTunnel: string }> {
   const pinComponents = components.filter((component) => component.typeId === "other.package_pin");
   return compiledPins.map((pin, index) => ({
     pinId: pin.id,
     label: pin.label ?? pin.id,
-    internalTunnel: typeof pinComponents[index]?.properties.internalTunnel === "string" ? (pinComponents[index]!.properties.internalTunnel as string) : "",
+    internalTunnel:
+      (typeof pinComponents[index]?.properties.internalTunnel === "string" && (pinComponents[index]!.properties.internalTunnel as string).trim())
+      || existingInterfaceByPinId.get(pin.id)?.internalTunnel
+      || "",
   }));
 }
 
@@ -2436,6 +2500,7 @@ async function saveSymbolCommand(
 
   const packageKey = view === "logicSymbol" ? "logicSymbolPackage" : "package";
   const existingPackage = extractPackageForEditing(json, packageKey);
+  const existingInterfaceByPinId = extractSubcircuitInterfaceMap(json);
   const existingBackground = existingPackage.background;
   const result = compileSymbolAuthoringComponents(components, existingBackground);
   if (!result.package) {
@@ -2461,7 +2526,7 @@ async function saveSymbolCommand(
     const internal = compileSubcircuitInternalComponents(components, wires);
     json.components = internal.components.map((component) => ({ id: component.id, typeId: component.typeId, properties: component.properties, visual: component.visual, boardVisual: component.boardVisual, exposed: component.exposed }));
     json.wires = internal.wires.map((wire) => ({ from: wire.from, to: wire.to, points: wire.points }));
-    json.interface = compileSubcircuitInterface(components, result.package.pins);
+    json.interface = compileSubcircuitInterface(components, result.package.pins, existingInterfaceByPinId);
   }
 
   try {
